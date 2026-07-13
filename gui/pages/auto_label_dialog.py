@@ -8,7 +8,7 @@
 """
 
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QButtonGroup, QDialog, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QPushButton,
     QComboBox, QGroupBox, QFormLayout, QRadioButton, QDoubleSpinBox,
     QCheckBox, QListWidget, QListWidgetItem, QSplitter, QMessageBox,
     QFileDialog, QScrollArea, QWidget, QTabWidget, QTextEdit, QLineEdit
@@ -19,8 +19,10 @@ import os
 import json
 from typing import Dict, List, Optional
 
-from gui.styles import COLORS
+from gui.styles import COLORS, CONTROL_HEIGHT_LG, RADIUS_SM
 from gui.widgets.app_dialog import confirm, show_warning
+from gui.widgets.collapsible_section import CollapsibleSection
+from gui.widgets.context_help import ContextHelp
 
 # LLM配置文件路径
 LLM_CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'llm_config.json')
@@ -159,41 +161,6 @@ SIZE_NAMES = {
 }
 
 
-class CollapsibleSection(QWidget):
-    """可折叠的高级设置区：默认收起，只有需要的人才展开。"""
-
-    def __init__(self, title: str, parent=None):
-        super().__init__(parent)
-        self._title = title
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-
-        self.toggle_button = QPushButton()
-        self.toggle_button.setObjectName("link")
-        self.toggle_button.setCheckable(True)
-        self.toggle_button.toggled.connect(self._on_toggled)
-        layout.addWidget(self.toggle_button, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        self.body = QWidget()
-        self.body.setVisible(False)
-        layout.addWidget(self.body)
-
-        self._sync_text()
-
-    def _on_toggled(self, checked: bool):
-        self.body.setVisible(checked)
-        self._sync_text()
-
-    def _sync_text(self):
-        arrow = "▾" if self.toggle_button.isChecked() else "▸"
-        self.toggle_button.setText(f"{arrow} {self._title}")
-
-    def set_expanded(self, expanded: bool):
-        self.toggle_button.setChecked(expanded)
-
-
 def _sam_model_exists(model_file: str) -> bool:
     """SAM 模型文件是否已经在本地（下载逻辑找的就是这几个位置）。"""
     if not model_file:
@@ -249,29 +216,49 @@ class AutoLabelDialog(QDialog):
         self.update_preview()
 
     def init_ui(self):
-        """初始化界面"""
+        """初始化界面：一句话说明 → 使用说明 → 标签页（滚动）→ 固定的配置摘要 → 按钮。
+
+        摘要和按钮不进滚动区，也不浮在内容上面：它们是主布局里的独立行，
+        滚动区永远停在它们上边，不会被盖住。
+        """
+        self.setObjectName("autoLabelDialog")
+        self.setStyleSheet(self._dialog_stylesheet())
+
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(20, 20, 20, 16)
         main_layout.setSpacing(12)
 
-        # 标题与说明
-        heading = QLabel("自动标注设置")
-        heading.setObjectName("h2")
-        main_layout.addWidget(heading)
-
-        subtitle = QLabel("先选一种标注方式，再调参数。设置保存后，标注页的自动标注就按这里的配置执行。")
+        # 顶部只留一句结果说明，易错点收进轻量帮助
+        subtitle = QLabel("选择标注方式并保存，标注页会立即使用这里的配置。")
         subtitle.setObjectName("subtitle")
         subtitle.setWordWrap(True)
         main_layout.addWidget(subtitle)
 
+        self.context_help = ContextHelp(
+            [
+                "YOLO 生成检测框，SAM 分割轮廓，LLM 根据文字描述识别目标。",
+                "置信度越高，结果通常越少；批量运行前请先确认模型和范围。",
+                "覆盖原标签会替换已有标注，且无法撤销。",
+            ],
+            risk_steps=[3],
+            title="配置提示",
+        )
+        main_layout.addWidget(self.context_help)
+
         # 三种标注方式各一个标签页
         self.tab_widget = QTabWidget()
+        self.tab_widget.setObjectName("autoLabelTabs")
         self.tab_widget.addTab(self._wrap_scroll(self.create_yolo_tab()), "YOLO 检测")
         self.tab_widget.addTab(self._wrap_scroll(self.create_sam_tab()), "SAM 分割")
         self.tab_widget.addTab(self._wrap_scroll(self.create_llm_tab()), "LLM 视觉")
         self.tab_widget.currentChanged.connect(lambda _: self.update_preview())
 
         main_layout.addWidget(self.tab_widget, 1)
+
+        # 摘要区：一条分隔线划清「上面是可滚动的设置，下面是固定的结论」
+        divider = QFrame()
+        divider.setObjectName("divider")
+        main_layout.addWidget(divider)
 
         # 预览确认 + 风险/执行状态
         self.lbl_preview = QLabel()
@@ -282,7 +269,7 @@ class AutoLabelDialog(QDialog):
         self.lbl_notice.setWordWrap(True)
         main_layout.addWidget(self.lbl_notice)
 
-        # 按钮组：主操作只有「保存设置」
+        # 按钮组：主操作只有「保存设置」。两个按钮同高同内边距，基线才对得齐
         button_layout = QHBoxLayout()
         button_layout.addStretch()
 
@@ -298,6 +285,52 @@ class AutoLabelDialog(QDialog):
         button_layout.addWidget(self.btn_save)
 
         main_layout.addLayout(button_layout)
+
+        # 焦点落在标签页上，而不是「使用说明」：说明是可以 Tab 过去、Enter 展开的，
+        # 但一打开就把焦点（和 Enter）交给它，等于把这一页的主线让给了帮助。
+        self.tab_widget.setFocus()
+
+    def _dialog_stylesheet(self) -> str:
+        """只作用于本弹窗的样式：去掉白底套白底，把选中态说清楚。
+
+        标签页内容底色改成画布色，白色的分组卡片才有「卡片」的样子；
+        模型来源的两个选项各自是一块可选区域——选中 = 圆点实心 + 标题加粗 + 轻背景，
+        三个信号一起说同一件事，不再只靠一个蓝点。
+
+        底部两个按钮的高度写在样式表里而不是 setMinimumHeight()：
+        控件一旦被样式表接管，QSS 里的 min-height 会盖掉代码设的最小高度。
+        22 + 上下 padding 5 + 上下 border 1 = CONTROL_HEIGHT_LG。
+        """
+        return f"""
+            QDialog#autoLabelDialog QPushButton#primary,
+            QDialog#autoLabelDialog QPushButton#secondary {{
+                min-height: {CONTROL_HEIGHT_LG - 12}px;
+                min-width: 96px;
+                padding: 5px 14px;
+            }}
+            QTabWidget#autoLabelTabs::pane {{
+                background-color: {COLORS['background']};
+                border: 1px solid {COLORS['border']};
+                border-radius: {RADIUS_SM}px;
+                top: -1px;
+            }}
+            QTabWidget#autoLabelTabs QTabBar::tab:selected {{
+                background-color: {COLORS['background']};
+                border-bottom-color: {COLORS['background']};
+            }}
+            QFrame#sourceOption {{
+                background-color: transparent;
+                border: 1px solid transparent;
+                border-radius: {RADIUS_SM}px;
+            }}
+            QFrame#sourceOption[selected="true"] {{
+                background-color: {COLORS['selected']};
+                border-color: {COLORS['border']};
+            }}
+            QWidget#optionDetail {{
+                background-color: transparent;
+            }}
+        """
 
     def _wrap_scroll(self, content: QWidget) -> QScrollArea:
         """标签页内容放进滚动区：窗口再小也只是出滚动条，不截断。"""
@@ -347,10 +380,10 @@ class AutoLabelDialog(QDialog):
         self.rbtn_official = QRadioButton("官方预训练模型（首次使用会自动下载）")
         self.rbtn_official.setChecked(True)
         self.rbtn_official.toggled.connect(self.on_model_source_changed)
-        layout.addWidget(self.rbtn_official)
 
         # 官方模型的版本 / 型号 / 任务
         self.official_widget = QWidget()
+        self.official_widget.setObjectName("optionDetail")
         official_layout = QFormLayout(self.official_widget)
         official_layout.setContentsMargins(24, 0, 0, 0)
 
@@ -367,14 +400,15 @@ class AutoLabelDialog(QDialog):
         self.cb_model_task.currentTextChanged.connect(lambda _: self.update_preview())
         official_layout.addRow("任务类型:", self.cb_model_task)
 
-        layout.addWidget(self.official_widget)
+        self.official_option = self._source_option(self.rbtn_official, self.official_widget)
+        layout.addWidget(self.official_option)
 
         # 自定义模型
         self.rbtn_custom = QRadioButton("自定义模型（本地 .pt / .pth 文件）")
         self.rbtn_custom.toggled.connect(self.on_model_source_changed)
-        layout.addWidget(self.rbtn_custom)
 
         self.custom_widget = QWidget()
+        self.custom_widget.setObjectName("optionDetail")
         custom_layout = QHBoxLayout(self.custom_widget)
         custom_layout.setContentsMargins(24, 0, 0, 0)
 
@@ -386,13 +420,34 @@ class AutoLabelDialog(QDialog):
         self.btn_browse_model.clicked.connect(self.browse_custom_model)
         custom_layout.addWidget(self.btn_browse_model)
 
-        layout.addWidget(self.custom_widget)
+        self.custom_option = self._source_option(self.rbtn_custom, self.custom_widget)
+        layout.addWidget(self.custom_option)
+
+        # 两个单选钮现在各自待在自己的选项块里。QRadioButton 的自动互斥是按「同一个父控件」
+        # 算的，父控件不同就不再互斥——点自定义不会把官方那个取消掉。所以显式编组。
+        self.source_button_group = QButtonGroup(self)
+        self.source_button_group.addButton(self.rbtn_official)
+        self.source_button_group.addButton(self.rbtn_custom)
 
         # 初始化模型型号列表 + 来源可用状态
         self.on_model_version_changed(self.cb_model_version.currentText())
         self.on_model_source_changed()
 
         return group
+
+    def _source_option(self, radio: QRadioButton, detail: QWidget) -> QFrame:
+        """一个模型来源 = 单选钮 + 它自己的详细设置，整块是一个可选区域。"""
+        option = QFrame()
+        option.setObjectName("sourceOption")
+        option.setProperty("selected", False)
+
+        layout = QVBoxLayout(option)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+        layout.addWidget(radio)
+        layout.addWidget(detail)
+
+        return option
 
     def create_inference_params_group(self) -> QGroupBox:
         """创建推理参数组"""
@@ -442,9 +497,10 @@ class AutoLabelDialog(QDialog):
         """类别映射：进阶用法，默认折叠"""
         section = CollapsibleSection("类别映射（可选：模型类别与项目类别不一致时使用）")
 
-        layout = QVBoxLayout(section.body)
+        layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
+        section.add_layout(layout)
 
         # 启用映射选项
         self.chk_enable_mapping = QCheckBox("启用类别映射")
@@ -527,7 +583,7 @@ class AutoLabelDialog(QDialog):
         self.update_preview()
 
     def on_model_source_changed(self):
-        """模型来源改变时更新界面"""
+        """模型来源改变时更新界面：选中的那一块要一眼能认出来。"""
         if self.rbtn_custom.isChecked():
             self.model_source = "custom"
         else:
@@ -537,6 +593,20 @@ class AutoLabelDialog(QDialog):
         self.btn_browse_model.setEnabled(is_custom)
         self.lbl_custom_model.setEnabled(is_custom)
         self.official_widget.setEnabled(not is_custom)
+
+        # 圆点（单选钮自己画）+ 标题字重 + 轻背景，三个信号一起表达选中
+        for option, radio, chosen in (
+            (self.official_option, self.rbtn_official, not is_custom),
+            (self.custom_option, self.rbtn_custom, is_custom),
+        ):
+            option.setProperty("selected", chosen)
+            option.style().unpolish(option)
+            option.style().polish(option)
+
+            font = radio.font()
+            font.setBold(chosen)
+            radio.setFont(font)
+
         self.update_preview()
 
     def browse_custom_model(self):
@@ -754,8 +824,13 @@ class AutoLabelDialog(QDialog):
 
         self.lbl_preview.setText(preview)
         self.lbl_preview.setStyleSheet(f"color: {COLORS['text_secondary']};")
-        self.lbl_notice.setText(notice)
+        self._set_notice(notice, color)
+
+    def _set_notice(self, text: str, color: str):
+        """没有提示就把这一行收掉：空标签照样占一行高度，底部白白多出一条空带。"""
+        self.lbl_notice.setText(text)
         self.lbl_notice.setStyleSheet(f"color: {color};")
+        self.lbl_notice.setVisible(bool(text))
 
     def _yolo_preview(self):
         if self.model_source == "custom":
@@ -801,8 +876,7 @@ class AutoLabelDialog(QDialog):
 
     def _set_status(self, text: str, color: str):
         """执行状态（当前只有 SAM 模型下载会用到）。"""
-        self.lbl_notice.setText(text)
-        self.lbl_notice.setStyleSheet(f"color: {color};")
+        self._set_notice(text, color)
 
     def on_save_clicked(self):
         """保存设置。
@@ -979,8 +1053,9 @@ class AutoLabelDialog(QDialog):
         layout.addLayout(form)
 
         advanced = CollapsibleSection("高级参数（仅 FastSAM 生效）")
-        advanced_layout = QFormLayout(advanced.body)
+        advanced_layout = QFormLayout()
         advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced.add_layout(advanced_layout)
 
         # 置信度阈值（FastSAM用）
         self.sb_sam_conf = QDoubleSpinBox()
@@ -1209,9 +1284,10 @@ class AutoLabelDialog(QDialog):
         """提示词模板：默认折叠，不挡住上面的基础配置"""
         section = CollapsibleSection("提示词模板（高级）")
 
-        layout = QVBoxLayout(section.body)
+        layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
+        section.add_layout(layout)
 
         # 系统提示词
         layout.addWidget(QLabel("系统提示词:"))

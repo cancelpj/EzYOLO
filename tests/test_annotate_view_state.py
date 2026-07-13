@@ -234,10 +234,22 @@ def test_status_bar_shows_and_refreshes_progress_category_and_batch_state():
     settle()
     assert_status_widgets_do_not_overlap()
 
+    # 批量任务跑着的时候，进度和取消入口就该一直在——哪怕期间标了个框、切了张图，
+    # 那些都会调 update_status_bar。以前这里是无条件清空，用户看着像是任务没了。
     page.on_batch_inference_progress(1, 2, 3, "正在处理的超长文件名.jpg")
-    assert page.status_batch.text().startswith("批处理: 2/3"), "批处理状态没有显示在独立底栏字段"
+    assert page.status_batch.text().startswith("批量标注: 2/3"), "批处理状态没有显示在独立底栏字段"
+    assert page.btn_cancel_batch.isVisible(), "批量任务跑着的时候必须有取消入口"
+
     page.update_status_bar()
-    assert page.status_batch.text() == "", "常规状态刷新后批处理临时状态没有清空"
+    assert page.status_batch.text().startswith("批量标注: 2/3"), \
+        "常规状态刷新把正在跑的批量任务进度抹掉了"
+    assert page.btn_cancel_batch.isVisible(), "常规状态刷新把取消入口抹掉了"
+    assert_status_widgets_do_not_overlap()
+
+    # 任务结束之后才清空
+    page._finish_batch_ui()
+    assert page.status_batch.text() == "", "任务结束后批处理临时状态没有清空"
+    assert not page.btn_cancel_batch.isVisible(), "任务结束后取消入口还留着"
 
     close(window, project_id)
 

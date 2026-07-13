@@ -361,11 +361,11 @@ QScrollArea {{
 }}
 
 QToolTip {{
-    background-color: {c['panel']};
-    color: {c['text_primary']};
-    border: 1px solid {c['border_strong']};
-    border-radius: {RADIUS_SM}px;
-    padding: 6px 9px;
+    background-color: #3A3A3C;
+    color: #FFFFFF;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    padding: 8px 10px;
 }}
 
 /* ---------- 文字 ---------- */
@@ -548,18 +548,20 @@ QPushButton:disabled {{
     border-color: {c['border']};
 }}
 
-/* QPushButton 的菜单箭头不交给平台绘制：macOS 会退化成黑点或空白。 */
-QPushButton[menuIndicator="true"] {{
-    padding-right: 32px;
+/* QPushButton / QToolButton 的菜单箭头不交给平台绘制：macOS 会退化成黑点或空白。
+   右侧专用区域固定 34px（图标 16px + 两侧留白），保证文字不会被箭头挤到贴边。 */
+QPushButton[menuIndicator="true"], QToolButton[menuIndicator="true"] {{
+    padding-right: 34px;
 }}
 
-QPushButton[menuIndicator="true"]::menu-indicator {{
+QPushButton[menuIndicator="true"]::menu-indicator,
+QToolButton[menuIndicator="true"]::menu-indicator {{
     image: url({chevron_down});
     subcontrol-origin: padding;
     subcontrol-position: right center;
-    width: 12px;
-    height: 12px;
-    right: 10px;
+    width: 16px;
+    height: 16px;
+    right: 9px;
 }}
 
 QPushButton#primary[menuIndicator="true"]::menu-indicator {{
@@ -567,7 +569,8 @@ QPushButton#primary[menuIndicator="true"]::menu-indicator {{
 }}
 
 QPushButton[menuIndicator="true"]::menu-indicator:disabled,
-QPushButton#primary[menuIndicator="true"]::menu-indicator:disabled {{
+QPushButton#primary[menuIndicator="true"]::menu-indicator:disabled,
+QToolButton[menuIndicator="true"]::menu-indicator:disabled {{
     image: url({chevron_down_off});
 }}
 
@@ -686,19 +689,20 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabl
 
 /* 箭头区要先占住位置，否则长选项的文字会压到箭头底下 */
 QComboBox {{
-    padding-right: 28px;
+    padding-right: 34px;
 }}
 
 QSpinBox, QDoubleSpinBox {{
-    padding-right: 22px;
+    padding-right: 26px;
+    min-height: 24px;
 }}
 
-/* 下拉框：整块都能点开，所以不给箭头区画边框/底色，只在悬停时亮一个浅色圆角块 */
+/* 下拉框：整块都能点开（专用区固定 34px），所以不给箭头区画边框/底色，
+   只在悬停时亮一个浅色圆角块 */
 QComboBox::drop-down {{
     subcontrol-origin: padding;
     subcontrol-position: center right;
-    width: 24px;
-    margin: 3px 3px 3px 0;
+    width: 34px;
     border: none;
     border-radius: 6px;
     background-color: transparent;
@@ -710,8 +714,8 @@ QComboBox::drop-down:hover {{
 
 QComboBox::down-arrow {{
     image: url({chevron_down});
-    width: 12px;
-    height: 12px;
+    width: 14px;
+    height: 14px;
 }}
 
 QComboBox::down-arrow:disabled {{
@@ -738,12 +742,13 @@ QComboBox QAbstractItemView::item {{
     min-height: 20px;
 }}
 
-/* 数字框的步进器：跟下拉框同一套雪佛龙，上下各占一半高 */
+/* 数字框的步进器：跟下拉框同一套雪佛龙，上下各占边框盒一半高（18px），
+   subcontrol-origin 取 border 而不是 padding，两个按钮首尾相接、点击区不缩水。 */
 QSpinBox::up-button, QDoubleSpinBox::up-button,
 QSpinBox::down-button, QDoubleSpinBox::down-button {{
-    subcontrol-origin: padding;
+    subcontrol-origin: border;
     width: 20px;
-    height: 11px;
+    height: 18px;
     border: none;
     border-radius: 4px;
     margin-right: 3px;
@@ -752,12 +757,10 @@ QSpinBox::down-button, QDoubleSpinBox::down-button {{
 
 QSpinBox::up-button, QDoubleSpinBox::up-button {{
     subcontrol-position: top right;
-    margin-top: 3px;
 }}
 
 QSpinBox::down-button, QDoubleSpinBox::down-button {{
     subcontrol-position: bottom right;
-    margin-bottom: 3px;
 }}
 
 QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
@@ -767,14 +770,14 @@ QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
 
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
     image: url({chevron_up});
-    width: 9px;
-    height: 9px;
+    width: 12px;
+    height: 12px;
 }}
 
 QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
     image: url({chevron_down});
-    width: 9px;
-    height: 9px;
+    width: 12px;
+    height: 12px;
 }}
 
 /* 到头了 / 整个控件禁用：箭头转灰，不再假装还能点 */
@@ -902,6 +905,33 @@ QMenu::separator {{
     height: 1px;
     background-color: {c['border']};
     margin: 4px 8px;
+}}
+
+/* 自动标注这类「选一个操作」的菜单（objectName = actionMenu）。
+   默认的 QMenu 是给命令列表用的：一行 20 出头像素、裸文字，点开像系统临时弹层，
+   而这里每一项的份量差得很远——「设置」只是打开一个窗口，「批量标注…」会跑一整批。
+   所以行高抬到 40px、图标 16px 各就各位、文字左对齐；hover 只用浅蓝底，
+   靠 1px 边框分层，不加厚阴影。 */
+QMenu#actionMenu {{
+    background-color: {c['panel']};
+    border: 1px solid {c['border_strong']};
+    border-radius: {RADIUS_SM}px;
+    padding: 6px;
+}}
+
+QMenu#actionMenu::item {{
+    min-height: 40px;
+    padding: 0px 24px 0px 8px;
+    border-radius: 6px;
+}}
+
+QMenu#actionMenu::item:selected {{
+    background-color: {c['selected']};
+    color: {c['text_primary']};
+}}
+
+QMenu#actionMenu::icon {{
+    padding-left: 12px;
 }}
 
 /* ---------- 分组框 ---------- */

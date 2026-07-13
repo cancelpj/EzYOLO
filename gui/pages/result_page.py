@@ -31,6 +31,7 @@ from PyQt6.QtGui import QPixmap
 
 from gui.styles import COLORS, RADIUS_SM, set_menu_indicator
 from gui.workflow import APP_ROOT, find_project_runs
+from gui.widgets.context_help import ContextHelp
 from gui.widgets.workflow_widgets import EmptyState
 
 
@@ -584,6 +585,16 @@ class ResultPage(QWidget):
         layout = QVBoxLayout(inner)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(14)
+
+        self.context_help = ContextHelp(
+            [
+                "优先看 mAP50 和预测示例，曲线用于辅助判断。",
+                "损失下降并趋稳，通常表示训练正在收敛。",
+                "导出使用最佳权重，不会修改原来的训练结果。",
+            ],
+            title="指标怎么看",
+        )
+        layout.addWidget(self.context_help)
 
         layout.addWidget(self.create_verdict_card())
         layout.addWidget(self.create_run_card())

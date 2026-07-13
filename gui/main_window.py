@@ -92,6 +92,9 @@ class MainWindow(QMainWindow):
         self.settings_page.auto_label_config_requested.connect(self.open_auto_label_config)
         self.import_page.projects_changed.connect(self.on_projects_changed)
         self.import_page.project_data_changed.connect(self.refresh_workflow)
+        self.import_page.display_name_rule_changed.connect(
+            self.annotate_page.on_display_name_rule_changed
+        )
 
         # 启动时同步数据库与真实文件
         self.sync_database_files()

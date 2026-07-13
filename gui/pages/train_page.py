@@ -17,6 +17,8 @@ from html import escape
 from typing import Dict, List, Optional
 
 from gui.styles import COLORS, mono_font_family_css, set_menu_indicator
+from gui.widgets.collapsible_section import CollapsibleSection
+from gui.widgets.context_help import ContextHelp
 from gui.widgets.elided_combo import ElidedComboBox
 from gui.workflow import (
     STEP_IMPORT, STEP_ANNOTATE, STEP_RESULT,
@@ -174,44 +176,6 @@ class NoWheelSlider(QSlider):
             super().wheelEvent(event)
         else:
             event.ignore()
-
-
-class CollapsibleSection(QWidget):
-    """默认收起的区域：点标题才展开，避免一进页面就是一堵参数墙。"""
-
-    def __init__(self, title: str, parent=None):
-        super().__init__(parent)
-        self._title = title
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-
-        self.toggle = QPushButton()
-        self.toggle.setObjectName("ghost")
-        self.toggle.setCheckable(True)
-        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.toggle.setMinimumHeight(34)
-        self.toggle.setStyleSheet("text-align: left; padding-left: 6px;")
-        self.toggle.toggled.connect(self._on_toggled)
-        layout.addWidget(self.toggle)
-
-        self.content = QWidget()
-        content_layout = QVBoxLayout(self.content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(12)
-        self.content.setVisible(False)
-        layout.addWidget(self.content)
-
-        self._content_layout = content_layout
-        self._on_toggled(False)
-
-    def _on_toggled(self, checked: bool):
-        self.content.setVisible(checked)
-        self.toggle.setText(f"{'▾' if checked else '▸'} {self._title}")
-
-    def add_widget(self, widget: QWidget):
-        self._content_layout.addWidget(widget)
 
 
 class TrainingThread(QThread):
@@ -887,6 +851,17 @@ class TrainPage(QWidget):
         scroll_layout = QVBoxLayout(self.scroll_content)
         scroll_layout.setContentsMargins(0, 0, 6, 0)
         scroll_layout.setSpacing(12)
+
+        self.context_help = ContextHelp(
+            [
+                "开始前确认图片、标注和类别都已准备完成。",
+                "先用小模型和较少轮次跑通流程，再调整高级参数。",
+                "停止会结束本次训练；已生成结果会保留，但不能从当前进度继续。",
+            ],
+            risk_steps=[3],
+            title="训练前检查",
+        )
+        scroll_layout.addWidget(self.context_help)
 
         scroll_layout.addWidget(self.create_prep_card())
         scroll_layout.addWidget(self.create_basic_card())

@@ -9,7 +9,7 @@ import sqlite3
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from contextlib import contextmanager
 
 
@@ -199,6 +199,14 @@ class Database:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_image_groups_project ON image_groups(project_id)"
         )
+
+        cursor.execute("PRAGMA table_info(projects)")
+        project_columns = {row[1] for row in cursor.fetchall()}
+        if 'display_name_rule' not in project_columns:
+            # 只加列，不填默认值：NULL 就表示「没设置过规则」，
+            # gui.display_names.parse_display_name_rule(None) 会把它当成 original 处理，
+            # 旧项目的显示行为不会因为升级数据库结构而改变。
+            cursor.execute("ALTER TABLE projects ADD COLUMN display_name_rule TEXT")
     
     # ==================== 项目操作 ====================
     
@@ -258,15 +266,25 @@ class Database:
     
     def update_project(self, project_id: int, **kwargs) -> bool:
         """更新项目信息"""
-        allowed_fields = ['name', 'description', 'type', 'classes', 'status', 'storage_path']
+        allowed_fields = [
+            'name', 'description', 'type', 'classes', 'status', 'storage_path',
+            'display_name_rule',
+        ]
         updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
-        
+
         if not updates:
             return False
-        
+
         # 处理classes字段
         if 'classes' in updates and isinstance(updates['classes'], list):
             updates['classes'] = json.dumps(updates['classes'], ensure_ascii=False)
+
+        # display_name_rule 存的是 JSON 字符串；传字典进来时顺手序列化，
+        # 调用方也可以自己先用 serialize_display_name_rule 转好再传字符串。
+        if 'display_name_rule' in updates and isinstance(updates['display_name_rule'], dict):
+            updates['display_name_rule'] = json.dumps(
+                updates['display_name_rule'], ensure_ascii=False
+            )
         
         updates['updated_at'] = datetime.now().isoformat()
         
@@ -324,7 +342,7 @@ class Database:
                 query += " AND group_id = ?"
                 params.append(group_id)
 
-            query += " ORDER BY created_at"
+            query += " ORDER BY created_at, id"
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
 
@@ -351,7 +369,7 @@ class Database:
             cursor = conn.cursor()
             cursor.execute(
                 f"SELECT * FROM images WHERE project_id = ? AND ({where_clause}) "
-                "ORDER BY created_at",
+                "ORDER BY created_at, id",
                 params
             )
             return [dict(row) for row in cursor.fetchall()]
@@ -365,7 +383,7 @@ class Database:
                 FROM images
                 INNER JOIN annotations ON images.id = annotations.image_id
                 WHERE images.project_id = ? AND annotations.class_id = ?
-                ORDER BY images.created_at
+                ORDER BY images.created_at, images.id
             """, (project_id, class_id))
             return [dict(row) for row in cursor.fetchall()]
 
@@ -395,7 +413,7 @@ class Database:
             if annotated_only:
                 query += " AND images.status = ?"
                 params.append('annotated')
-            query += " ORDER BY images.created_at"
+            query += " ORDER BY images.created_at, images.id"
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
 
@@ -690,6 +708,92 @@ class Database:
                 annotations.append(ann)
             return annotations
     
+    def _read_bbox_previews(self, cursor, project_id: int) -> Dict[int, List[Dict]]:
+        """在给定 cursor 上读框。调用方负责事务边界。"""
+        cursor.execute("""
+            SELECT image_id, class_id, data
+            FROM annotations
+            WHERE project_id = ? AND type = 'bbox'
+            ORDER BY image_id, id
+        """, (project_id,))
+
+        previews: Dict[int, List[Dict]] = {}
+        for row in cursor.fetchall():
+            try:
+                data = json.loads(row['data'])
+            except (TypeError, ValueError):
+                continue  # 坏掉的一条标注不该让整页缩略图画不出来
+            previews.setdefault(row['image_id'], []).append({
+                'type': 'bbox',
+                'class_id': row['class_id'],
+                'data': data,
+            })
+        return previews
+
+    def _read_annotation_versions(self, cursor, project_id: int) -> Dict[int, Tuple[int, int, str]]:
+        """在给定 cursor 上读版本号。调用方负责事务边界。"""
+        cursor.execute("""
+            SELECT image_id,
+                   COUNT(*) AS box_count,
+                   MAX(id) AS max_id,
+                   MAX(COALESCE(updated_at, created_at)) AS last_changed
+            FROM annotations
+            WHERE project_id = ?
+            GROUP BY image_id
+        """, (project_id,))
+        return {
+            row['image_id']: (row['box_count'], row['max_id'], row['last_changed'])
+            for row in cursor.fetchall()
+        }
+
+    def get_project_bbox_previews(self, project_id: int) -> Dict[int, List[Dict]]:
+        """整个项目的 bbox，一次查完，按 image_id 分好组。
+
+        导入页要在几百张缩略图上画框。逐图调 get_image_annotations 就是典型的
+        N+1：600 张图 = 600 次查询，翻页时全压在主线程上。这里一次查回来，
+        而且只取画框用得上的三列，不去读 attributes 那些用不到的字段。
+
+        只返回 bbox；缩略图预览不画多边形和关键点。
+        """
+        with self.get_connection() as conn:
+            return self._read_bbox_previews(conn.cursor(), project_id)
+
+    def get_project_annotation_versions(self, project_id: int) -> Dict[int, Tuple[int, int, str]]:
+        """每张图的标注版本号：(框数, 最大标注 id, 最近改动时间)，同样只查一次。
+
+        版本号是给缩略图缓存用的——「这张图的标注变了没有」。三个字段缺一不可：
+
+          框数        加框、删框
+          最大 id     删一个再加一个：框数没变，但新标注的 id 一定更大
+          改动时间    框被拖动 / 改类别：走 update_annotation，updated_at 会刷新
+
+        只看框数会漏掉后两种，缩略图就会一直停在旧的框上；只看 status 更糟，
+        改完框图片还是 annotated，界面永远不刷新。
+        """
+        with self.get_connection() as conn:
+            return self._read_annotation_versions(conn.cursor(), project_id)
+
+    def get_project_bbox_preview_snapshot(
+        self, project_id: int
+    ) -> Tuple[Dict[int, List[Dict]], Dict[int, Tuple[int, int, str]]]:
+        """框和版本号必须来自同一个读快照，所以只能一起读。
+
+        分两次调 get_project_bbox_previews / get_project_annotation_versions 会各开
+        一条连接、各拿一个快照：sqlite 默认对 SELECT 不开事务。中间只要有人挪了一
+        个框，读到的就是「旧框 + 新版本号」——缩略图按新版本号缓存住旧框，从此再也
+        不会失效，框在界面上永远停在旧位置。
+
+        显式 BEGIN 把两条 SELECT 圈进同一个读事务：第一条 SELECT 定下快照，第二条
+        看到的还是它。旧框配旧版本号，下一轮刷新照样能发现版本变了、把它换掉。
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")  # 没有它，两条 SELECT 各自 autocommit，各看各的库
+            return (
+                self._read_bbox_previews(cursor, project_id),
+                self._read_annotation_versions(cursor, project_id),
+            )
+
     def delete_annotation(self, annotation_id: int) -> bool:
         """删除标注"""
         with self.get_connection() as conn:

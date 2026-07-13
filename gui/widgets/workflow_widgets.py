@@ -91,12 +91,16 @@ class StepNavItem(QPushButton):
 
         self.name = QLabel(f"{step['num']}. {step['name']}")
         self.name.setFont(self._sized_font(self.NAME_PX, bold=True))
-        self.name.setStyleSheet(f"color: {COLORS['text_primary']};")
+        self.name.setStyleSheet(
+            self._label_style(COLORS['text_primary'], self.NAME_PX, bold=True)
+        )
         text_col.addWidget(self.name)
 
         self.status = QLabel("")
         self.status.setFont(self._sized_font(self.STATUS_PX))
-        self.status.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self.status.setStyleSheet(
+            self._label_style(COLORS['text_secondary'], self.STATUS_PX)
+        )
         text_col.addWidget(self.status)
 
         layout.addLayout(text_col)
@@ -109,6 +113,22 @@ class StepNavItem(QPushButton):
             font.setWeight(QFont.Weight.DemiBold)
         return font
 
+    @staticmethod
+    def _label_style(color: str, pixel_size: int, bold: bool = False) -> str:
+        """让导航字号不受应用级主题样式覆盖。
+
+        应用样式表给 QWidget 设了默认字号，而 Qt 样式表的优先级高于
+        ``QFont.setPixelSize``。如果局部样式只写颜色，名称和状态会被覆盖成同一
+        字号，高 DPI 下布局缓存的高度也会跟着失真。因此把字号、字重和状态颜色
+        放在同一条局部样式里，亮色/暗色主题刷新都不会改变组件自己的尺寸契约。
+        """
+        weight = 600 if bold else 400
+        return (
+            f"color: {color}; "
+            f"font-size: {pixel_size}px; "
+            f"font-weight: {weight};"
+        )
+
     def sizeHint(self):
         return self.layout().sizeHint()
 
@@ -118,17 +138,24 @@ class StepNavItem(QPushButton):
     def apply_state(self, state: str, status_text: str):
         self.mark.setText(STATE_MARK.get(state, '○'))
         self.mark.setStyleSheet(
-            f"color: {STATE_COLOR.get(state, COLORS['text_secondary'])};"
+            self._label_style(
+                STATE_COLOR.get(state, COLORS['text_secondary']),
+                self.NAME_PX,
+            )
         )
 
         if state == LOCKED:
             name_color = COLORS['text_disabled']
         else:
             name_color = COLORS['text_primary']
-        self.name.setStyleSheet(f"color: {name_color};")
+        self.name.setStyleSheet(
+            self._label_style(name_color, self.NAME_PX, bold=True)
+        )
 
         self.status.setText(status_text)
-        self.status.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self.status.setStyleSheet(
+            self._label_style(COLORS['text_secondary'], self.STATUS_PX)
+        )
 
         # 状态文字从无到有会让内容变高，得让父布局重新问一次尺寸
         self.updateGeometry()
