@@ -24,11 +24,18 @@ from gui.widgets.workflow_widgets import StepNav, PageHeader, StepGate, NoticeBa
 from gui.widgets.elided_combo import ElidedComboBox
 from gui.pages.import_page import ImportPage
 from gui.pages.annotate_page import AnnotatePage
-from gui.pages.train_page import TrainPage
+from gui.pages.train_page import APP_ROOT, TrainPage
 from gui.pages.result_page import ResultPage
 from gui.pages.test_page import TestPage
 from gui.pages.settings_page import SettingsPage, THEME_SETTING_KEY
 from gui.pages.about_page import AboutPage
+from gui.remote_training_runtime import (
+    RemoteTrainingRuntimeError,
+    build_system_remote_backend,
+    current_remote_training_runtime_paths,
+)
+from gui.remote_training_thread import RemoteConnectionTestThread
+from core.remote_training.transport import ClientTransportUnavailable, RemoteTransportError
 from models.database import db
 
 GATE_INDEX = 7  # 前置条件说明页在 content_stack 中的位置
@@ -57,6 +64,7 @@ class MainWindow(QMainWindow):
         self.snapshot = get_project_snapshot(None)
         self.step_states = compute_step_states(self.snapshot)
         self._bypassed_steps = set()
+        self._remote_profile_test_thread = None
 
         self.init_ui()
         self.load_window_state()
@@ -90,6 +98,12 @@ class MainWindow(QMainWindow):
 
         self.settings_page.theme_changed.connect(self.on_theme_changed)
         self.settings_page.auto_label_config_requested.connect(self.open_auto_label_config)
+        self.settings_page.remote_profiles_changed.connect(
+            self.train_page.refresh_remote_targets
+        )
+        self.settings_page.remote_profile_test_requested.connect(
+            self.start_remote_profile_test
+        )
         self.import_page.projects_changed.connect(self.on_projects_changed)
         self.import_page.project_data_changed.connect(self.refresh_workflow)
         self.import_page.display_name_rule_changed.connect(
@@ -338,6 +352,36 @@ class MainWindow(QMainWindow):
             else:
                 self.settings_page.set_status("没有改动自动标注设置。")
 
+    def start_remote_profile_test(self, profile) -> None:
+        """设置页的「测试连接」只做 preflight，网络 I/O 始终放到后台线程。"""
+        if (
+            self._remote_profile_test_thread is not None
+            and self._remote_profile_test_thread.isRunning()
+        ):
+            self.settings_page.set_remote_profile_test_status(
+                "已有连接预检正在进行，请稍候。",
+                success=None,
+            )
+            return
+        try:
+            paths = current_remote_training_runtime_paths(APP_ROOT)
+            backend = build_system_remote_backend(paths)
+        except (RemoteTrainingRuntimeError, ClientTransportUnavailable, RemoteTransportError) as exc:
+            self.settings_page.set_remote_profile_test_status(str(exc), success=False)
+            return
+
+        thread = RemoteConnectionTestThread(profile=profile, backend=backend)
+        self._remote_profile_test_thread = thread
+        thread.preflight_finished.connect(self.on_remote_profile_test_finished)
+        thread.finished.connect(self._clear_remote_profile_test_thread)
+        thread.start()
+
+    def on_remote_profile_test_finished(self, success: bool, message: str, _capabilities) -> None:
+        self.settings_page.set_remote_profile_test_status(message, success=success)
+
+    def _clear_remote_profile_test_thread(self) -> None:
+        self._remote_profile_test_thread = None
+
     def on_gate_bypassed(self):
         """用户选择「我有现成的模型，直接测试」这类跳过。"""
         self._bypassed_steps.add(self.current_index)
@@ -426,6 +470,31 @@ class MainWindow(QMainWindow):
         QThread 还在 run() 里时被销毁会直接崩，所以推理和 LLM 批量这两条
         长任务在这里各自收工（都带超时，不会把退出流程拖住）。
         """
+        # 训练线程不在主线程里做网络/训练 I/O。不能为了退出窗口而粗暴 terminate：
+        # 本机训练需要收尾，远程训练还必须等 runner 确认取消，避免界面把未确认的
+        # 服务器任务误说成已经停止。
+        if not self.train_page.request_close():
+            self.notice.show_message(
+                "训练仍在安全收尾，窗口暂不关闭。",
+                "远程训练会等待服务器确认停止；本机训练会等待当前后台线程结束。"
+                "训练结束后请再关闭窗口。",
+            )
+            event.ignore()
+            return
+
+        # 连接预检同样是 QThread。预检不支持强杀；它只含带超时的只读 SSH 请求，
+        # 等结果返回后重新关闭即可，不能销毁仍在运行的线程对象。
+        if (
+            self._remote_profile_test_thread is not None
+            and self._remote_profile_test_thread.isRunning()
+        ):
+            self.notice.show_message(
+                "远程连接预检仍在进行，窗口暂不关闭。",
+                "预检只读取服务器能力，不上传数据；结束后请再关闭窗口。",
+            )
+            event.ignore()
+            return
+
         for page in (self.test_page, self.annotate_page):
             shutdown = getattr(page, 'shutdown', None)
             if shutdown:

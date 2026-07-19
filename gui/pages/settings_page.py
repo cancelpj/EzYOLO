@@ -21,12 +21,18 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QGroupBox, QSpinBox, QCheckBox,
     QScrollArea, QFrame, QFileDialog, QInputDialog, QComboBox,
+    QMessageBox,
 )
 from PyQt6.QtCore import Qt, QSettings, pyqtSignal
 from PyQt6.QtGui import QKeySequence
 
 from gui.styles import COLORS, THEME_CHOICES, THEME_LIGHT, normalize_theme
 from gui.widgets.elided_label import ElidedLabel
+from gui.pages.remote_training_profile_dialog import RemoteTrainingProfileDialog
+from core.remote_training.profile_store import (
+    RemoteTrainingProfileStore,
+    RemoteTrainingProfileStoreError,
+)
 
 APP_ROOT = Path(__file__).parent.parent.parent
 DEFAULT_PRETRAINED_PATH = APP_ROOT / "pretrained"
@@ -123,10 +129,17 @@ class SettingsPage(QWidget):
     # 设置页自己不认识 AutoLabelDialog，由主窗口接住并打开标注页那一个实例
     auto_label_config_requested = pyqtSignal(str)
 
+    # 训练页只需要刷新目标下拉；连接测试由主窗口/远程线程执行，设置页不直接做 I/O。
+    remote_profiles_changed = pyqtSignal()
+    remote_profile_test_requested = pyqtSignal(object)
+
     def __init__(self):
         super().__init__()
         self.settings = QSettings("EzYOLO", "Settings")
         self.shortcut_buttons = {}
+        self.remote_profile_store = RemoteTrainingProfileStore(self.settings)
+        self._remote_profiles = []
+        self._remote_profile_test_running = False
         self.init_ui()
 
     def init_ui(self):
@@ -152,6 +165,7 @@ class SettingsPage(QWidget):
         column_layout.setContentsMargins(0, 0, 0, 0)
         column_layout.setSpacing(14)
         column_layout.addWidget(self.create_common_group())
+        column_layout.addWidget(self.create_remote_training_group())
         column_layout.addWidget(self.create_ai_group())
         column_layout.addWidget(self.create_shortcut_group())
 
@@ -242,6 +256,215 @@ class SettingsPage(QWidget):
         self.pretrained_path.setToolTip(
             f"{self._pretrained_path_value}\n训练时从这个目录读取 YOLO 预训练权重（.pt 文件）。"
         )
+
+    def create_remote_training_group(self) -> QGroupBox:
+        """远程训练服务器：只管理公开连接档案，绝不在设置中保存认证秘密。"""
+        group = QGroupBox("远程训练服务器")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(10)
+
+        hint = QLabel(
+            "可选功能。登录认证由系统 OpenSSH / ssh-agent 管理；这里不保存密码、私钥或口令。"
+        )
+        hint.setObjectName("caption")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        self.remote_profile_combo = QComboBox()
+        self.remote_profile_combo.setObjectName("remote_training_profile_combo")
+        self.remote_profile_combo.setToolTip("选择一个已保存的远程训练服务器档案。")
+        self.remote_profile_combo.currentIndexChanged.connect(self._refresh_remote_profile_actions)
+        row.addWidget(self.remote_profile_combo, 1)
+
+        self.btn_add_remote_profile = QPushButton("添加…")
+        self.btn_add_remote_profile.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_add_remote_profile.clicked.connect(self.add_remote_profile)
+        row.addWidget(self.btn_add_remote_profile)
+
+        self.btn_edit_remote_profile = QPushButton("编辑…")
+        self.btn_edit_remote_profile.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_edit_remote_profile.clicked.connect(self.edit_remote_profile)
+        row.addWidget(self.btn_edit_remote_profile)
+
+        self.btn_delete_remote_profile = QPushButton("移除")
+        self.btn_delete_remote_profile.setObjectName("danger")
+        self.btn_delete_remote_profile.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete_remote_profile.clicked.connect(self.delete_remote_profile)
+        row.addWidget(self.btn_delete_remote_profile)
+        layout.addLayout(row)
+
+        test_row = QHBoxLayout()
+        test_row.setContentsMargins(0, 0, 0, 0)
+        self.btn_test_remote_profile = QPushButton("测试连接")
+        self.btn_test_remote_profile.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_test_remote_profile.setToolTip(
+            "只读取服务器能力信息，不上传数据、不创建任务，也不会开始训练。"
+        )
+        self.btn_test_remote_profile.clicked.connect(self.request_remote_profile_test)
+        test_row.addWidget(self.btn_test_remote_profile)
+        test_row.addStretch()
+        layout.addLayout(test_row)
+
+        self.remote_profile_status = QLabel("")
+        self.remote_profile_status.setObjectName("caption")
+        self.remote_profile_status.setWordWrap(True)
+        layout.addWidget(self.remote_profile_status)
+
+        self.refresh_remote_profiles()
+        return group
+
+    @staticmethod
+    def _remote_profile_text(profile) -> str:
+        return f"{profile.name} · {profile.username}@{profile.host}:{profile.port}"
+
+    def refresh_remote_profiles(self, selected_id: str | None = None) -> None:
+        """从严格存储恢复档案；损坏数据 fail closed，不偷偷跳过未知字段。"""
+        current_id = selected_id or self.remote_profile_combo.currentData()
+        try:
+            profiles = self.remote_profile_store.list()
+        except RemoteTrainingProfileStoreError:
+            self._remote_profiles = []
+            self.remote_profile_combo.blockSignals(True)
+            self.remote_profile_combo.clear()
+            self.remote_profile_combo.addItem("远程服务器档案无法读取")
+            self.remote_profile_combo.blockSignals(False)
+            self.remote_profile_status.setText(
+                "已保存的远程服务器档案格式不安全，未加载。请联系管理员或重新添加档案。"
+            )
+            self.remote_profile_status.setStyleSheet(f"color: {COLORS['error']};")
+            self._refresh_remote_profile_actions()
+            return
+
+        self._remote_profiles = profiles
+        self.remote_profile_combo.blockSignals(True)
+        self.remote_profile_combo.clear()
+        if not profiles:
+            self.remote_profile_combo.addItem("还没有远程服务器")
+        else:
+            for profile in profiles:
+                self.remote_profile_combo.addItem(
+                    self._remote_profile_text(profile),
+                    profile.id,
+                )
+            selected_index = self.remote_profile_combo.findData(current_id)
+            self.remote_profile_combo.setCurrentIndex(
+                selected_index if selected_index >= 0 else 0
+            )
+        self.remote_profile_combo.blockSignals(False)
+
+        if profiles:
+            self.remote_profile_status.setText(
+                f"已保存 {len(profiles)} 台服务器。测试连接只做只读预检，不会上传数据或开始训练。"
+            )
+            self.remote_profile_status.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        else:
+            self.remote_profile_status.setText("还没有服务器档案；训练页会继续只显示本地训练。")
+            self.remote_profile_status.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self._refresh_remote_profile_actions()
+
+    def selected_remote_profile(self):
+        profile_id = self.remote_profile_combo.currentData()
+        return next(
+            (profile for profile in self._remote_profiles if profile.id == profile_id),
+            None,
+        )
+
+    def _refresh_remote_profile_actions(self, _index: int | None = None) -> None:
+        selected = self.selected_remote_profile()
+        enabled = selected is not None
+        self.btn_edit_remote_profile.setEnabled(enabled)
+        self.btn_delete_remote_profile.setEnabled(enabled)
+        self.btn_test_remote_profile.setEnabled(
+            enabled and not self._remote_profile_test_running
+        )
+        if selected is not None:
+            self.remote_profile_combo.setToolTip(
+                f"{self._remote_profile_text(selected)}\n服务器目录：{selected.remote_root}"
+            )
+
+    def add_remote_profile(self) -> None:
+        dialog = RemoteTrainingProfileDialog(parent=self)
+        if dialog.exec() != dialog.DialogCode.Accepted or dialog.saved_profile is None:
+            return
+        try:
+            self.remote_profile_store.save([*self._remote_profiles, dialog.saved_profile])
+        except RemoteTrainingProfileStoreError:
+            self.set_status("远程服务器档案未能保存。", 'warning')
+            return
+        self.refresh_remote_profiles(dialog.saved_profile.id)
+        self.remote_profiles_changed.emit()
+        self.set_status("远程服务器档案已添加。", 'success')
+
+    def edit_remote_profile(self) -> None:
+        selected = self.selected_remote_profile()
+        if selected is None:
+            return
+        dialog = RemoteTrainingProfileDialog(selected, parent=self)
+        if dialog.exec() != dialog.DialogCode.Accepted or dialog.saved_profile is None:
+            return
+        profiles = [
+            dialog.saved_profile if profile.id == selected.id else profile
+            for profile in self._remote_profiles
+        ]
+        try:
+            self.remote_profile_store.save(profiles)
+        except RemoteTrainingProfileStoreError:
+            self.set_status("远程服务器档案未能保存。", 'warning')
+            return
+        self.refresh_remote_profiles(dialog.saved_profile.id)
+        self.remote_profiles_changed.emit()
+        self.set_status("远程服务器档案已更新。", 'success')
+
+    def delete_remote_profile(self) -> None:
+        selected = self.selected_remote_profile()
+        if selected is None:
+            return
+        reply = QMessageBox.question(
+            self,
+            "移除远程服务器",
+            f"确定移除“{selected.name}”吗？\n\n"
+            "这只会删除本机保存的公开连接档案，不会删除服务器上的任何数据或任务。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.remote_profile_store.delete(selected.id)
+        except RemoteTrainingProfileStoreError:
+            self.set_status("远程服务器档案未能移除。", 'warning')
+            return
+        self.refresh_remote_profiles()
+        self.remote_profiles_changed.emit()
+        self.set_status("远程服务器档案已移除。", 'success')
+
+    def request_remote_profile_test(self) -> None:
+        selected = self.selected_remote_profile()
+        if selected is None:
+            return
+        self._remote_profile_test_running = True
+        self._refresh_remote_profile_actions()
+        self.remote_profile_status.setText("正在进行只读连接预检…")
+        self.remote_profile_status.setStyleSheet(f"color: {COLORS['accent_text']};")
+        self.remote_profile_test_requested.emit(selected)
+
+    def set_remote_profile_test_status(self, text: str, *, success: bool | None) -> None:
+        if success is not None:
+            self._remote_profile_test_running = False
+        self.remote_profile_status.setText(text)
+        color = (
+            COLORS['success']
+            if success is True
+            else COLORS['error']
+            if success is False
+            else COLORS['accent_text']
+        )
+        self.remote_profile_status.setStyleSheet(f"color: {color};")
+        self._refresh_remote_profile_actions()
 
     def create_ai_group(self) -> QGroupBox:
         """AI 与自动标注：显示当前用的是什么，并且就地打开配置

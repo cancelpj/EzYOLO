@@ -1,0 +1,17 @@
+{
+  "protocol_version": 1,
+  "canonical_remote_root": "/home/ezyolo/ezyolo-remote/run",
+  "model_allowlist": {
+    "yolo11n": "/home/ezyolo/ezyolo-remote/models/yolo11n.pt"
+  },
+  "runtime": {
+    "launcher": "/home/ezyolo/ezyolo-remote/.venv/bin/ezyolo-remote-train"
+  },
+  "max_epochs": 300,
+  "max_runtime_seconds": 21600,
+  "max_payload_bytes": 21474836480,
+  "max_jobs_bytes": 32212254720,
+  "max_results_bytes": 10737418240,
+  "min_free_disk_bytes": 21474836480,
+  "single_task": true
+}
