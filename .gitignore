@@ -6,6 +6,9 @@ datasets/
 data/
 outputs/
 
+# 本地 AI 记忆目录（不纳入版本库）
+.workbuddy/
+
 # 开发和临时文件
 .git/
 __pycache__/
