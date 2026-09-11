@@ -631,7 +631,7 @@ class RandomSampleDeleteWorker(QThread):
 
 class AnnotationCanvas(QFrame):
     """标注画布组件"""
-    
+
     annotation_created = pyqtSignal(dict)  # 标注创建信号
     annotation_selected = pyqtSignal(int)  # 标注选中信号
     annotation_modified = pyqtSignal(int, dict, dict)  # 标注修改信号：id, 修改前 data, 修改后 data
@@ -2813,11 +2813,18 @@ class AnnotatePage(QWidget):
         self.image_name_label = QLabel()
         self.image_name_label.setObjectName("title")
         self.image_name_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        self.image_name_label.setMinimumWidth(240)
-        self.image_name_label.setMaximumWidth(320)
+        # 放宽宽度：状态栏挤不动时挪到这里（顶部比状态栏宽 ~50%），文件名终于能看全。
+        # 没有最大宽度：让 layout 的 column stretch 自由伸缩，必要时让工具栏自适应。
+        self.image_name_label.setMinimumWidth(260)
         self.image_name_label.setMinimumHeight(TOOLBAR_BUTTON_HEIGHT)
         self._register_elided_label(self.image_name_label)
         self._set_elided_text(self.image_name_label, "未选择图片")
+        # 顶部 image_name_label 现在也承担「点击复制文件名」的职责。
+        # _copyable_filename 是真实 filename（display name 可能被项目规则改写成
+        # 「帧 223」之类的代号，复制出去不可用）；cursor + mousePressEvent 由
+        # _update_context_bar 按当前是否选图来切换，避免点空气。
+        self.image_name_label._copyable_filename = ""
+        self.image_name_label.mousePressEvent = self._on_image_name_label_pressed
 
         # 标注方式（任务类型）：决定用什么形状标注。
         self.task_combo = QComboBox()
@@ -3917,10 +3924,13 @@ class AnnotatePage(QWidget):
 
         if not self.current_project_id:
             self._set_elided_text(self.image_name_label, "未选择项目")
+            self._set_copyable_filename("")
         elif not self.images:
             self._set_elided_text(self.image_name_label, "这个项目还没有图片")
+            self._set_copyable_filename("")
         elif index < 0:
             self._set_elided_text(self.image_name_label, "未选择图片")
+            self._set_copyable_filename("")
         else:
             image = self.images[index]
             status = "已标注" if image.get('status') == 'annotated' else "还没标注"
@@ -3931,6 +3941,9 @@ class AnnotatePage(QWidget):
                 f"第 {index + 1}/{total} 张 · {self._image_display_name(image)} · {status}",
                 tooltip=self._image_tooltip(image)
             )
+            # 点击复制真实 filename（不是 display name），display name 可能被项目规则
+            # 改写成「帧 223」之类代号，复制出去不可用。
+            self._set_copyable_filename(image.get('filename', ''))
 
         if hasattr(self, 'image_list_title'):
             self.image_list_title.setText(f"图片 · {total}" if total else "图片")
@@ -3944,6 +3957,47 @@ class AnnotatePage(QWidget):
                 self.image_list_caption.setText("还没有图片，请回到「数据导入」")
 
         self._update_canvas_placeholder()
+
+    def _set_copyable_filename(self, filename: str):
+        """让顶部 image_name_label 知道点它该复制什么，并相应切换鼠标手势。
+
+        filename 为空（未选项目/无图片/未选当前图）时回退 ArrowCursor，避免点空气。
+        真实 filename 存到 QLabel 实例属性 _copyable_filename，mousePressEvent 读它。
+        """
+        label = getattr(self, 'image_name_label', None)
+        if label is None:
+            return
+        label._copyable_filename = filename or ""
+        if label._copyable_filename:
+            # tooltip 已经由 _set_elided_text 设置成 _image_tooltip 的多行信息（包含
+            # 完整文件名 + 分辨率 + 路径），这里只在鼠标手势层面提示可点。
+            label.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            label.unsetCursor()
+
+    def _on_image_name_label_pressed(self, event):
+        """顶部 image_name_label 的左键 → 复制真实 filename 到剪贴板。
+
+        通过实例属性绑定（而非子类化 QLabel）：现有顶部 label 已经走
+        `_register_elided_label` 的 Resize 事件过滤链路，再叠一层子类会让该链路
+        多绕一次；实例属性 + 方法替换对调用方完全透明，行为只跟这一个标签相关。
+        """
+        if event.button() != Qt.MouseButton.LeftButton:
+            # 中键/右键不消费，沿用 QLabel 默认行为（保持可被选择/复制纯文本）。
+            QLabel.mousePressEvent(self.image_name_label, event)
+            return
+        filename = getattr(self.image_name_label, '_copyable_filename', '') or ''
+        if not filename:
+            return
+        # QToolTip 局部 import（与 _show_shortcut_help 一致）。
+        from PyQt6.QtWidgets import QToolTip
+        QApplication.clipboard().setText(filename)
+        QToolTip.showText(
+            self.image_name_label.mapToGlobal(QPoint(0, self.image_name_label.height())),
+            f"已复制: {filename}",
+            self.image_name_label
+        )
+        event.accept()
 
     def _update_canvas_placeholder(self):
         """画布空着的时候，告诉用户下一步该做什么。"""
@@ -6073,7 +6127,7 @@ class AnnotatePage(QWidget):
             f"color: {_readable_on_light(color)}; font-weight: 600;"
         )
         self._set_elided_text(
-            self.status_selected_class, f"选中框: ■ {name}",
+            self.status_selected_class, f"选中框: {name}",
             tooltip=f"选中框类别：{name}"
         )
     
