@@ -5,11 +5,13 @@
 """
 
 import json
+import random
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import os
 
+import yaml
 from models.database import db
 
 
@@ -355,6 +357,281 @@ class AnnotationImporter:
         
         return imported, skipped
     
+    def import_yolo_dataset(self, dataset_dir: str, auto_groups: bool = True,
+                           overwrite: bool = False) -> Dict:
+        """
+        导入完整的 YOLO 数据集目录（图片 + 标注 + 分类）一次性导入。
+
+        目录结构（两种都支持）：
+            dataset/
+                data.yaml            # 含 names: 分类定义
+                images/train/*.jpg   images/val/*.jpg
+                labels/train/*.txt   labels/val/*.txt
+        或扁平形式：
+            dataset/images/*.jpg  dataset/labels/*.txt
+
+        Args:
+            dataset_dir: 数据集根目录
+            auto_groups: 是否按 images 下的子目录（train/val/test）自动建分组
+            overwrite:    是否覆盖已存在的标注
+
+        Returns:
+            导入统计 dict
+        """
+        from core.import_manager import ImportManager
+
+        dataset_dir = Path(dataset_dir)
+        if not dataset_dir.is_dir():
+            raise ValueError(f"数据集目录不存在: {dataset_dir}")
+
+        # 1) 解析 data.yaml 拿到分类，并合并落库
+        new_classes = self._parse_yolo_dataset_yaml(dataset_dir)
+        if new_classes is None:
+            raise ValueError(
+                "在数据集目录未找到 data.yaml，或其中没有可用的 names 分类定义。"
+            )
+        self._merge_and_save_classes(new_classes)
+
+        # 2) 刷新内存里的类别信息（后续解析标注要靠它做 id->name 映射）
+        project = db.get_project(self.project_id)
+        self.classes = json.loads(project['classes']) if project['classes'] else []
+        self.class_map = {c['name']: c['id'] for c in self.classes}
+
+        # 3) 定位 images/labels 与各 split
+        img_root = dataset_dir / 'images'
+        lbl_root = dataset_dir / 'labels'
+        splits = self._detect_yolo_splits(img_root, lbl_root)
+        if not splits:
+            raise ValueError(
+                f"未在 {img_root} 找到图片。标准结构应为 images/train、images/val 或 images/*.jpg"
+            )
+
+        # 项目里已有的图片记录，用于去重，并避免逐张全表扫描（O(n) 而非 O(n²)）
+        existing_imgs = db.get_project_images(self.project_id)
+        existing_paths = {
+            img.get('original_path')
+            for img in existing_imgs
+            if img.get('original_path')
+        }
+        record_cache: Dict[str, Dict] = {}
+        for img in existing_imgs:
+            if img.get('original_path'):
+                record_cache[img['original_path']] = img
+            record_cache[img['filename']] = img
+
+        def _lookup_record(img_file_path: str, img_name: str):
+            if img_file_path in record_cache:
+                return record_cache[img_file_path]
+            if img_name in record_cache:
+                return record_cache[img_name]
+            rec = self._find_image_record(img_file_path)
+            if rec is not None:
+                record_cache[img_file_path] = rec
+                record_cache[img_name] = rec
+            return rec
+
+        image_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp', '.gif']
+        stats = {
+            'classes': len(self.classes),
+            'images_imported': 0,
+            'images_skipped': 0,
+            'annotations': 0,
+            'labels_missing': 0,
+            'splits': {},
+        }
+
+        for split_name, img_dir, lbl_dir in splits:
+            group_id = None
+            if auto_groups and split_name:
+                group_id = db.create_image_group(self.project_id, split_name)
+
+            importer = ImportManager(self.project_id, group_id=group_id)
+            split_img = split_ann = split_skip = split_missing = 0
+
+            image_files = []
+            for ext in image_exts:
+                image_files.extend(img_dir.glob(f"*{ext}"))
+                image_files.extend(img_dir.glob(f"*{ext.upper()}"))
+            image_files = sorted(set(image_files))
+
+            for img_file in image_files:
+                # 去重：同一 original_path 已存在则跳过图片导入（但仍可补标注）
+                if str(img_file) in existing_paths:
+                    image_record = _lookup_record(str(img_file), img_file.name)
+                    split_skip += 1
+                    stats['images_skipped'] += 1
+                else:
+                    if not importer.import_single_image(str(img_file)):
+                        split_skip += 1
+                        stats['images_skipped'] += 1
+                        continue
+                    image_record = _lookup_record(str(img_file), img_file.name)
+                    if image_record:
+                        existing_paths.add(str(img_file))
+                    split_img += 1
+                    stats['images_imported'] += 1
+
+                if not image_record:
+                    continue
+
+                # 标注
+                label_file = lbl_dir / f"{img_file.stem}.txt"
+                if not label_file.exists():
+                    split_missing += 1
+                    stats['labels_missing'] += 1
+                    continue
+
+                existing_anns = db.get_image_annotations(image_record['id'])
+                if existing_anns and not overwrite:
+                    # 已有标注且不覆盖：保留，仅标记已标注
+                    db.update_image_status(image_record['id'], 'annotated')
+                    continue
+                if existing_anns and overwrite:
+                    db.delete_image_annotations(image_record['id'])
+
+                image_info = {
+                    'width': image_record.get('width'),
+                    'height': image_record.get('height'),
+                }
+                if not image_info['width'] or not image_info['height']:
+                    info = self._get_image_info(str(img_file))
+                    if info:
+                        image_info = info
+
+                anns = self._parse_yolo_file(label_file, image_info)
+                project_task = self.project.get('type', 'detect')
+                for ann in anns:
+                    if project_task == 'segment' and 'points' in ann['data']:
+                        atype = 'polygon'
+                    elif project_task == 'pose' and 'keypoints' in ann['data']:
+                        atype = 'keypoint'
+                    elif project_task == 'obb' and 'angle' in ann['data']:
+                        atype = 'obb'
+                    else:
+                        atype = 'bbox'
+                    db.add_annotation(
+                        image_id=image_record['id'],
+                        project_id=self.project_id,
+                        class_id=ann['class_id'],
+                        class_name=ann['class_name'],
+                        annotation_type=atype,
+                        data=ann['data'],
+                    )
+                    split_ann += 1
+                    stats['annotations'] += 1
+
+                # 有标签文件即视为已标注（含空标签的负样本）
+                db.update_image_status(image_record['id'], 'annotated')
+
+            stats['splits'][split_name or 'all'] = {
+                'images': split_img,
+                'annotations': split_ann,
+                'skipped': split_skip,
+                'missing_labels': split_missing,
+            }
+
+        return stats
+
+    def _parse_yolo_dataset_yaml(self, dataset_dir: Path) -> Optional[List[Dict]]:
+        """在数据集目录找 data.yaml 并解析 names: 为类别列表。
+
+        兼容 names 写成 dict（{0: OK, 1: NG}）或 list（[OK, NG]）两种形式。
+        找不到 / 解析不出分类时返回 None。
+        """
+        yaml_path = dataset_dir / 'data.yaml'
+        if not yaml_path.exists():
+            alt = dataset_dir.parent / 'data.yaml'
+            yaml_path = alt if alt.exists() else None
+        if yaml_path is None:
+            hits = list(dataset_dir.glob('**/data.yaml'))
+            yaml_path = hits[0] if hits else None
+        if yaml_path is None:
+            return None
+
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+        except Exception as e:
+            print(f"解析 data.yaml 失败: {e}")
+            return None
+
+        if not isinstance(data, dict):
+            return None
+        names = data.get('names')
+        if not names:
+            return None
+
+        classes: List[Dict] = []
+        if isinstance(names, dict):
+            for k, v in names.items():
+                try:
+                    cid = int(k)
+                except (ValueError, TypeError):
+                    continue
+                classes.append({'id': cid, 'name': str(v)})
+        elif isinstance(names, list):
+            for i, v in enumerate(names):
+                classes.append({'id': i, 'name': str(v)})
+        else:
+            return None
+
+        if not classes:
+            return None
+
+        # 补 color（按 id 确定性生成，重复导入颜色稳定）
+        for c in classes:
+            if 'color' not in c:
+                rnd = random.Random(c['id'] + 1)
+                c['color'] = f"#{rnd.randint(0, 0xFFFFFF):06x}"
+        return classes
+
+    def _merge_and_save_classes(self, new_classes: List[Dict]) -> None:
+        """把 yaml 里的分类合并进项目类别并落库。
+
+        按 id 合并：已存在的 id 以 yaml 的 name 为准（保留已有 color），
+        新增的 id 直接补上。保证重复导入时类别稳定、不丢已有标注的映射。
+        """
+        existing = {c['id']: dict(c) for c in self.classes}
+        for nc in new_classes:
+            cid = nc['id']
+            if cid in existing:
+                existing[cid]['name'] = nc['name']
+            else:
+                existing[cid] = {
+                    'id': cid,
+                    'name': nc['name'],
+                    'color': nc.get('color', '#808080'),
+                }
+        merged = [existing[k] for k in sorted(existing.keys())]
+        db.update_project(self.project_id, classes=merged)
+        self.classes = merged
+        self.class_map = {c['name']: c['id'] for c in merged}
+
+    def _detect_yolo_splits(self, img_root: Path, lbl_root: Path) -> List[Tuple[str, Path, Path]]:
+        """探测 images 下的 train/val/test 子目录，或扁平 images/*.jpg。"""
+        splits: List[Tuple[str, Path, Path]] = []
+        if not img_root.is_dir():
+            return splits
+
+        sub_dirs = sorted(d.name for d in img_root.iterdir() if d.is_dir())
+        if sub_dirs:
+            for name in sub_dirs:
+                img_dir = img_root / name
+                lbl_dir = lbl_root / name
+                if any(img_dir.glob('*.*')):
+                    splits.append((name, img_dir, lbl_dir))
+        elif any(img_root.glob('*.*')):
+            splits.append(('', img_root, lbl_root))
+        return splits
+
+    def _find_image_record_by_path(self, image_path: str) -> Optional[Dict]:
+        """按 original_path 或文件名查找数据库中的图像记录。"""
+        filename = Path(image_path).name
+        for img in db.get_project_images(self.project_id):
+            if img.get('original_path') == image_path or img['filename'] == filename:
+                return img
+        return None
+
     def _parse_yolo_file(self, txt_file: Path, image_info: Dict) -> List[Dict]:
         """
         解析YOLO标注文件

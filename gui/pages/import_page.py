@@ -421,6 +421,11 @@ class ImportPage(QWidget):
         self.btn_import_annotations.clicked.connect(self.import_annotations)
         layout.addWidget(self.btn_import_annotations)
 
+        self.btn_import_dataset = QPushButton("导入数据集")
+        self.btn_import_dataset.setToolTip("选一个 YOLO 数据集目录，一次性导入图片、标注和分类")
+        self.btn_import_dataset.clicked.connect(self.import_dataset)
+        layout.addWidget(self.btn_import_dataset)
+
         layout.addStretch()
 
         # 任务类型：一个能点的胶囊，点开就是原来那个选择框
@@ -1985,7 +1990,166 @@ class ImportPage(QWidget):
             show_info(self, "标注导入完成", f"导入了 {imported} 个标注，跳过 {skipped} 个。")
         else:
             show_warning(self, "标注导入失败", message)
-    
+
+    def import_dataset(self):
+        """导入完整的 YOLO 数据集（图片 + 标注 + 分类）一次性导入。"""
+        dataset_dir = QFileDialog.getExistingDirectory(
+            self, "选择 YOLO 数据集目录", "",
+            QFileDialog.Option.ShowDirsOnly
+        )
+        if not dataset_dir:
+            return
+
+        # 轻量预览：校验结构并汇总将要导入的内容
+        preview = self._preview_yolo_dataset(dataset_dir)
+        if preview is None:
+            show_warning(
+                self, "不是有效的数据集目录",
+                "该目录下未找到 data.yaml，或没有 images 目录。\n\n"
+                "标准结构应为：\n"
+                "  dataset/\n"
+                "    data.yaml          # 含 names: 分类定义\n"
+                "    images/train/*.jpg   images/val/*.jpg\n"
+                "    labels/train/*.txt   labels/val/*.txt"
+            )
+            return
+
+        # 项目已有数据时，询问覆盖还是追加（按文件名去重）
+        has_data = bool(db.get_project_images(self.current_project_id))
+        overwrite = False
+        if has_data:
+            overwrite = confirm_destructive(
+                self, "项目已有数据",
+                "当前项目已经存在图片或标注。继续导入会按文件名去重追加；"
+                "若要用新数据集完全替换，请选择「覆盖」。",
+                detail="默认只追加不去重导入；选「覆盖」会删除已有的标注后再重新写入。",
+                confirm_text="覆盖",
+                cancel_text="追加（去重）",
+            )
+
+        # 预览确认
+        proceed = confirm(
+            self, "确认导入数据集",
+            preview['summary'],
+            detail=preview['detail'],
+            confirm_text="开始导入",
+            cancel_text="取消",
+        )
+        if not proceed:
+            return
+
+        self.loading_overlay = LoadingOverlay(self, "正在导入数据集...")
+        self.loading_overlay.show_loading()
+
+        class DatasetImportThread(QThread):
+            finished = pyqtSignal(bool, str, object)
+
+            def __init__(self, project_id, dataset_dir, overwrite):
+                super().__init__()
+                self.project_id = project_id
+                self.dataset_dir = dataset_dir
+                self.overwrite = overwrite
+
+            def run(self):
+                try:
+                    from core.annotation_importer import AnnotationImporter
+                    importer = AnnotationImporter(self.project_id)
+                    stats = importer.import_yolo_dataset(
+                        self.dataset_dir, auto_groups=True, overwrite=self.overwrite
+                    )
+                    self.finished.emit(True, "导入成功", stats)
+                except Exception as e:
+                    self.finished.emit(False, f"导入失败: {e}", None)
+
+        self.dataset_import_thread = DatasetImportThread(
+            self.current_project_id, dataset_dir, overwrite
+        )
+        self.dataset_import_thread.finished.connect(self.on_dataset_import_finished)
+        self.dataset_import_thread.start()
+
+    def _preview_yolo_dataset(self, dataset_dir: str) -> Optional[Dict]:
+        """轻量扫描数据集目录，返回预览信息；结构不合法返回 None。"""
+        import yaml
+        d = Path(dataset_dir)
+        yaml_path = d / 'data.yaml'
+        if not yaml_path.exists():
+            alt = d.parent / 'data.yaml'
+            if alt.exists():
+                yaml_path = alt
+        if not yaml_path.exists():
+            hits = list(d.glob('**/data.yaml'))
+            yaml_path = hits[0] if hits else None
+        if yaml_path is None:
+            return None
+
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        names = data.get('names')
+        if not names:
+            return None
+        if isinstance(names, dict):
+            class_names = [str(v) for v in names.values()]
+        elif isinstance(names, list):
+            class_names = [str(v) for v in names]
+        else:
+            return None
+        if not class_names:
+            return None
+
+        # 统计各 split 图片数
+        img_root = d / 'images'
+        splits_info = []
+        if img_root.is_dir():
+            sub_dirs = sorted(p.name for p in img_root.iterdir() if p.is_dir())
+            if sub_dirs:
+                for name in sub_dirs:
+                    cnt = len([p for p in (img_root / name).glob('*') if p.is_file()])
+                    splits_info.append(f"{name} {cnt} 张")
+            else:
+                cnt = len([p for p in img_root.glob('*') if p.is_file()])
+                if cnt:
+                    splits_info.append(f"images {cnt} 张")
+
+        summary = (
+            f"将导入 {len(class_names)} 个分类、"
+            f"{' / '.join(splits_info) if splits_info else '未检测到图片'}。"
+        )
+        detail = "分类：" + "、".join(class_names)
+        if not splits_info:
+            detail += "\n（注意：未在 images 下找到图片，导入后可能只有分类）"
+        return {'summary': summary, 'detail': detail, 'classes': class_names}
+
+    def on_dataset_import_finished(self, success, message, stats):
+        """数据集导入完成回调"""
+        if hasattr(self, 'loading_overlay'):
+            self.loading_overlay.hide_loading()
+            self.loading_overlay.deleteLater()
+            delattr(self, 'loading_overlay')
+
+        self.load_project_images()
+        self.refresh_view_filter_options()
+
+        if success and stats:
+            lines = [
+                f"分类数：{stats.get('classes', 0)}",
+                f"导入图片：{stats.get('images_imported', 0)} 张（跳过 {stats.get('images_skipped', 0)} 张）",
+                f"导入标注：{stats.get('annotations', 0)} 个",
+                f"缺对应标签：{stats.get('labels_missing', 0)} 个",
+            ]
+            for split, s in stats.get('splits', {}).items():
+                lines.append(
+                    f"  · {split}: 图片 {s['images']}、标注 {s['annotations']}、"
+                    f"跳过 {s['skipped']}、缺标签 {s['missing_labels']}"
+                )
+            show_info(self, "数据集导入完成", "\n".join(lines))
+        else:
+            show_warning(self, "数据集导入失败", message)
+
     def import_coco_annotations(self, group_id: int = None):
         """导入COCO标注"""
         file_path, _ = QFileDialog.getOpenFileName(
