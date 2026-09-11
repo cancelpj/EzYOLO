@@ -636,6 +636,10 @@ class AnnotationCanvas(QFrame):
     annotation_selected = pyqtSignal(int)  # 标注选中信号
     annotation_modified = pyqtSignal(int, dict, dict)  # 标注修改信号：id, 修改前 data, 修改后 data
     annotation_deleted = pyqtSignal(int)  # 标注删除信号
+    # 鼠标在画布上移动：发射图像像素坐标（带缩放/平移换算后的坐标）。
+    # 鼠标在图像外、画布为空、或鼠标离开控件时发射 (-1, -1)，状态栏据此清空。
+    # 与 annotation_* 解耦：不关心坐标的消费者可以只连自己感兴趣的信号。
+    cursor_moved = pyqtSignal(int, int)  # image_x, image_y；越界传 (-1, -1)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1757,9 +1761,26 @@ class AnnotationCanvas(QFrame):
         # 更新鼠标位置信息
         if self.current_image:
             img_x, img_y = self.widget_to_image(event.pos().x(), event.pos().y())
-        
+            # 越界检查：十字辅助线本身也会做这个判断（draw_guide_lines），
+            # 这里要复用同一份坐标语义：超出图像范围就让状态栏清空，
+            # 不然缩放放大、鼠标移到画布空白处时坐标还在闪，看着像 bug。
+            img_w = self.current_image.width()
+            img_h = self.current_image.height()
+            if 0 <= img_x < img_w and 0 <= img_y < img_h:
+                self.cursor_moved.emit(int(img_x), int(img_y))
+            else:
+                self.cursor_moved.emit(-1, -1)
+        else:
+            self.cursor_moved.emit(-1, -1)
+
         # 触发重绘以显示辅助线
         self.update()
+
+    def leaveEvent(self, event):
+        """鼠标离开画布：辅助线消失，状态栏坐标也得跟着清空。"""
+        self.current_point = None
+        self.cursor_moved.emit(-1, -1)
+        super().leaveEvent(event)
     
     def mouseReleaseEvent(self, event: QMouseEvent):
         """鼠标释放事件"""
@@ -3098,6 +3119,7 @@ class AnnotatePage(QWidget):
         self.canvas.annotation_selected.connect(self.on_annotation_selected)
         self.canvas.annotation_modified.connect(self.on_annotation_modified)
         self.canvas.annotation_deleted.connect(self.on_annotation_deleted)
+        self.canvas.cursor_moved.connect(self._on_canvas_cursor_moved)
         layout.addWidget(self.canvas, stretch=1)
 
         # 翻页：这一页最主要的下一步动作就是「下一张」
@@ -3858,6 +3880,20 @@ class AnnotatePage(QWidget):
 
         layout.addWidget(QLabel("|"))
 
+        # 鼠标在画布上的当前坐标（图像像素坐标，与十字辅助线交点一致）。
+        # 放在「本图标注」之后：「图片级数据 → 鼠标即时坐标」递进，习惯看状态栏
+        # 时眼睛是从左往右扫到的；同时不挤到右侧批量进度那块弹性区。
+        self.status_cursor = QLabel("X, Y: —")
+        # 等宽字体：坐标是数字，数字宽度不固定（4 位和 5 位）会来回抖；
+        # 设成等宽后视觉上是稳的，且不需要专门去算宽度。
+        cursor_font = QFont(get_primary_font_family())
+        cursor_font.setStyleHint(QFont.StyleHint.Monospace)
+        self.status_cursor.setFont(cursor_font)
+        self.status_cursor.setToolTip("鼠标在画布上的图像像素坐标（与十字辅助线交点一致）")
+        layout.addWidget(self.status_cursor)
+
+        layout.addWidget(QLabel("|"))
+
         self.status_tool = QLabel("工具: 矩形")
         layout.addWidget(self.status_tool)
 
@@ -3903,6 +3939,21 @@ class AnnotatePage(QWidget):
             self.btn_shortcut_help.toolTip(),
             self.btn_shortcut_help
         )
+
+    def _on_canvas_cursor_moved(self, img_x: int, img_y: int):
+        """画布的 cursor_moved 信号回调：把图像像素坐标写到状态栏。
+
+        x/y 为 -1（鼠标在图像外、画布为空、或者鼠标已经离开控件）时清空。
+        跨线程不会到这里——signal 来自画布的 mouseMoveEvent/leaveEvent，都是 GUI 线程。
+        """
+        if not hasattr(self, 'status_cursor'):
+            return
+        if img_x < 0 or img_y < 0:
+            self.status_cursor.setText("X, Y: —")
+        else:
+            # 用 4 位右对齐：1920x1080 主流、4K 也不超过 3840*2160，
+            # 固定宽度就不会因为「99」和「1920」位数不同导致布局抖动。
+            self.status_cursor.setText(f"X, Y: {img_x:>4}, {img_y:>4}")
 
     def _current_image_index(self) -> int:
         """当前图片在列表中的位置，没有则 -1。"""
@@ -6725,6 +6776,11 @@ class AnnotatePage(QWidget):
             current = 0
 
         self.status_image.setText(f"当前: {current}/{total}")
+        # 切图/筛选后立刻清空坐标：update_status_bar 总是先于鼠标移动被调用，
+        # 此时 status_cursor 还停在旧图坐标上会让用户以为切图没生效。
+        # 鼠标第一次移动时 cursor_moved 信号会重新填上，无需手动同步。
+        if hasattr(self, 'status_cursor'):
+            self.status_cursor.setText("X, Y: —")
         self.status_progress.setText(f"标注: {annotated}/{total}")
         self.status_annotation.setText(f"本图标注: {len(self.annotations)}")
         tool_names = {
