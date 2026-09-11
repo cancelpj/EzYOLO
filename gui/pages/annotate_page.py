@@ -2688,8 +2688,6 @@ class AnnotatePage(QWidget):
             self.canvas._refresh_lock_button()
         if hasattr(self, 'canvas'):
             self.canvas.update()
-        if hasattr(self, 'current_class_chip'):
-            self._update_current_class_chip()
 
     def _track_llm_worker(self, worker):
         """所有 LLM 线程都从这里登记生命周期。"""
@@ -3006,7 +3004,7 @@ class AnnotatePage(QWidget):
         self.image_filter = QComboBox()
         self.image_filter.addItems(["全部", "未标注", "已标注"])
         self.image_filter.setToolTip("只看还没标的图片，可以避免漏标")
-        self.image_filter.currentTextChanged.connect(self.filter_images)
+        self.image_filter.currentTextChanged.connect(self.on_image_filter_changed)
         layout.addWidget(self.image_filter)
 
         # 图片列表（✓ = 已标注，○ = 还没标）
@@ -3836,16 +3834,15 @@ class AnnotatePage(QWidget):
 
         layout.addWidget(QLabel("|"))
 
-        # 不能用 Ignored：布局会把它按近零宽度排，随后控件又被 minimumWidth 撑开，
-        # 造成与右侧分隔符重叠。Preferred 让布局按实际可见宽度为它留出位置。
-        # 当前类别仍保留颜色方块；长名称省略，完整名称放在 tooltip。
-        self.current_class_chip = QLabel()
-        self.current_class_chip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        self.current_class_chip.setMinimumWidth(120)
-        self.current_class_chip.setMaximumWidth(150)
-        self._register_elided_label(self.current_class_chip)
-        self._set_elided_text(self.current_class_chip, "类别: 未选择")
-        layout.addWidget(self.current_class_chip)
+        # 当前选中标注框所属类别（切图自动选中第一个框 / 点选框时刷新）。
+        # 占用原先「绘制类别」的位置：绘制类别不再单独显示，统一用此格展示选中框类别。
+        self.status_selected_class = QLabel("选中框: 未选择")
+        self.status_selected_class.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.status_selected_class.setMinimumWidth(120)
+        self.status_selected_class.setMaximumWidth(150)
+        self._register_elided_label(self.status_selected_class)
+        self.status_selected_class.setToolTip("当前选中标注框所属的类别")
+        layout.addWidget(self.status_selected_class)
 
         layout.addWidget(QLabel("|"))
 
@@ -3946,30 +3943,7 @@ class AnnotatePage(QWidget):
             else:
                 self.image_list_caption.setText("还没有图片，请回到「数据导入」")
 
-        self._update_current_class_chip()
         self._update_canvas_placeholder()
-
-    def _update_current_class_chip(self):
-        """状态栏上的「当前类别」：画上去的就是它。"""
-        if not hasattr(self, 'current_class_chip'):
-            return
-
-        current = next((cls for cls in self.classes if cls['id'] == self.current_class_id), None)
-        if current is None:
-            self.current_class_chip.setStyleSheet(f"color: {COLORS['text_secondary']};")
-            self._set_elided_text(
-                self.current_class_chip, "类别: 未选择",
-                tooltip="画上去的标注算哪个类别，在右侧「类别」里换"
-            )
-            return
-
-        self.current_class_chip.setStyleSheet(
-            f"color: {_readable_on_light(current.get('color'))}; font-weight: 600;"
-        )
-        self._set_elided_text(
-            self.current_class_chip, f"类别: ■ {current['name']}",
-            tooltip=f"当前类别：{current['name']}\n在右侧「类别」里切换"
-        )
 
     def _update_canvas_placeholder(self):
         """画布空着的时候，告诉用户下一步该做什么。"""
@@ -3992,11 +3966,20 @@ class AnnotatePage(QWidget):
         """没有项目/图片时就把对应的按钮关掉，别让人点了没反应。"""
         has_project = bool(self.current_project_id)
         has_image = bool(self.current_image_id)
-        index = self._current_image_index()
 
         if hasattr(self, 'btn_prev'):
-            self.btn_prev.setEnabled(index > 0)
-            self.btn_next.setEnabled(0 <= index < len(self.images) - 1)
+            visible = self._visible_image_ids()
+            if not visible:
+                self.btn_prev.setEnabled(False)
+                self.btn_next.setEnabled(False)
+            elif self.current_image_id in visible:
+                pos = visible.index(self.current_image_id)
+                self.btn_prev.setEnabled(pos > 0)
+                self.btn_next.setEnabled(pos < len(visible) - 1)
+            else:
+                # 当前图被筛选隐藏，但可见列表里还有图，两个方向都能跳
+                self.btn_prev.setEnabled(True)
+                self.btn_next.setEnabled(True)
 
         for name in ('btn_draw_tool', 'btn_keypoint', 'btn_move', 'btn_delete'):
             button = getattr(self, name, None)
@@ -4286,7 +4269,6 @@ class AnnotatePage(QWidget):
             self.sample_target_class.setCurrentIndex(0)
         self.sample_target_class.blockSignals(False)
         self.update_sample_control_panel(class_sample_counts, negative_sample_count)
-        self._update_current_class_chip()
 
         # 默认选中第一个类别
         if self.class_list.count() > 0:
@@ -4297,6 +4279,9 @@ class AnnotatePage(QWidget):
             )
             self.class_list.setCurrentRow(selected_row)
             self.on_class_selected()
+
+        # 左侧图片筛选下拉：按当前项目类别动态补充「类别: xxx」筛选项
+        self._rebuild_image_filter_options()
 
     def get_sample_target_images(self, target_class_id):
         """获取指定标签对应的样本图像列表"""
@@ -4373,7 +4358,6 @@ class AnnotatePage(QWidget):
 
         self._sync_attr_class_combo_from_list()
         self._refresh_annotation_class_controls()
-        self._update_current_class_chip()
 
     def _sync_attr_class_combo_from_list(self):
         """将类别列表当前选择同步到属性下拉框。"""
@@ -5751,24 +5735,6 @@ class AnnotatePage(QWidget):
             self._invalidate_sample_stats_cache()
             self.update_sample_control_panel()
     
-    def update_status_bar(self):
-        """更新状态栏"""
-        if self.images and self.current_image_id:
-            # 找到当前图像的索引
-            current_index = next((i for i, img in enumerate(self.images) if img['id'] == self.current_image_id), -1)
-            if current_index >= 0:
-                self.status_image.setText(f"当前: {current_index + 1}/{len(self.images)}")
-        else:
-            self.status_image.setText("当前: 0/0")
-        
-        # 更新标注数量
-        self.status_annotation.setText(f"标注: {len(self.annotations)}")
-        
-        # 更新工具状态
-        tool_names = {'rectangle': '矩形', 'polygon': '多边形', 'move': '移动'}
-        tool_name = tool_names.get(self.canvas.current_tool, '矩形')
-        self.status_tool.setText(f"工具: {tool_name}")
-    
     def on_class_selected(self):
         """类别选中事件"""
         current_item = self.class_list.currentItem()
@@ -5778,10 +5744,59 @@ class AnnotatePage(QWidget):
             self.canvas.current_class_id = self.current_class_id
             self._sync_attr_class_combo_from_list()
         self._refresh_annotation_class_controls()
-        self._update_current_class_chip()
-    
+
+    def _rebuild_image_filter_options(self):
+        """按当前项目类别，动态重建左侧图片筛选下拉：固定项 + 每个类别一项（带含该类别图片数）。"""
+        if not hasattr(self, 'image_filter'):
+            return
+        prev = self.image_filter.currentText()
+        # 各类别「包含该类别的图片数」（与筛选语义一致：按图片去重）
+        counts = {}
+        if self.current_project_id:
+            try:
+                counts = db.get_project_image_counts_by_class(self.current_project_id)
+            except Exception:
+                counts = {}
+        self.image_filter.blockSignals(True)
+        self.image_filter.clear()
+        self.image_filter.addItem("全部")
+        self.image_filter.addItem("未标注")
+        self.image_filter.addItem("已标注")
+        for cls in self.classes:
+            cid = cls['id']
+            try:
+                cid = int(cid)
+            except (TypeError, ValueError):
+                cid = cls['id']
+            n = counts.get(cid, 0)
+            self.image_filter.addItem(f"类别: {cls['name']} ({n})", cls['id'])
+        self.image_filter.blockSignals(False)
+        # 尽量还原之前的筛选项；不存在（如类别被改名/删除）则退回「全部」
+        idx = self.image_filter.findText(prev)
+        self.image_filter.setCurrentIndex(idx if idx >= 0 else 0)
+        # 显式应用一次筛选，确保重建后图片列表与当前筛选项一致
+        self.filter_images(self.image_filter.currentText())
+
     def filter_images(self, filter_text: str):
         """筛选图片"""
+        # 按类别筛选：只显示包含该类别标注的图片
+        if filter_text.startswith("类别: "):
+            class_id = self.image_filter.currentData()
+            image_ids = set()
+            if self.current_project_id and class_id is not None:
+                try:
+                    image_ids = {
+                        img['id']
+                        for img in db.get_project_images_by_class(self.current_project_id, int(class_id))
+                    }
+                except (TypeError, ValueError):
+                    image_ids = set()
+            for i in range(self.image_list.count()):
+                item = self.image_list.item(i)
+                image_id = item.data(Qt.ItemDataRole.UserRole)
+                item.setHidden(image_id not in image_ids)
+            return
+
         for i in range(self.image_list.count()):
             item = self.image_list.item(i)
             image_id = item.data(Qt.ItemDataRole.UserRole)
@@ -5799,7 +5814,12 @@ class AnnotatePage(QWidget):
                 item.setHidden(status != 'pending')
             elif filter_text == "已标注":
                 item.setHidden(status == 'pending')
-    
+
+    def on_image_filter_changed(self, filter_text: str):
+        """筛选条件改变：先刷新左栏可见项，再默认选中可见集第一张（滚动跟随）。"""
+        self.filter_images(filter_text)
+        self._select_first_visible_image()
+
     def on_image_selected(self, item: QListWidgetItem):
         """图片选中事件"""
         image_id = item.data(Qt.ItemDataRole.UserRole)
@@ -5868,7 +5888,17 @@ class AnnotatePage(QWidget):
         
         # 加载标注
         self.load_annotations()
-        
+
+        # 默认高亮选中第一个标注框，便于一眼看到它属于哪个类别
+        if self.annotations:
+            first = self.annotations[0]
+            self.canvas.selected_annotation_id = first['id']
+            self.canvas.annotation_selected.emit(first['id'])
+            self.canvas.update()
+
+        # 同步状态栏的「选中框类别」显示（无标注时显示未选择）
+        self.update_selected_class_status()
+
         # 更新状态栏
         self.update_status_bar()
         
@@ -5930,6 +5960,7 @@ class AnnotatePage(QWidget):
         self.clear_attribute_panel(refresh_sample_panel=False)
         self.update_status_bar()
         self.update_delete_menu_state()
+        self.update_selected_class_status()
 
     def delete_current_image(self):
         """删除当前图片及其全部标注和实际文件。"""
@@ -6018,6 +6049,33 @@ class AnnotatePage(QWidget):
         annotation = next((ann for ann in self.annotations if ann['id'] == annotation_id), None)
         if annotation:
             self.update_attribute_panel(annotation)
+        # 状态栏同步显示「当前选中标注框所属的类别」
+        self.update_selected_class_status()
+
+    def update_selected_class_status(self):
+        """状态栏显示当前选中标注框所属的类别（占用原「绘制类别」位置）。"""
+        if not hasattr(self, 'status_selected_class'):
+            return
+        sel_id = getattr(self.canvas, 'selected_annotation_id', None)
+        ann = next((a for a in self.annotations if a['id'] == sel_id), None)
+        if ann is None:
+            self.status_selected_class.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            self._set_elided_text(
+                self.status_selected_class, "选中框: 未选择",
+                tooltip="当前选中标注框所属的类别"
+            )
+            return
+        cid = ann.get('class_id')
+        cls = next((c for c in self.classes if c['id'] == cid), None)
+        name = cls['name'] if cls else f"类别{cid}"
+        color = cls.get('color', '#808080') if cls else '#808080'
+        self.status_selected_class.setStyleSheet(
+            f"color: {_readable_on_light(color)}; font-weight: 600;"
+        )
+        self._set_elided_text(
+            self.status_selected_class, f"选中框: ■ {name}",
+            tooltip=f"选中框类别：{name}"
+        )
     
     def on_annotation_modified(self, annotation_id: int, old_data: dict, new_data: dict):
         """标注修改事件（拖动或调整大小后）"""
@@ -6046,6 +6104,7 @@ class AnnotatePage(QWidget):
         self.load_annotations()
         self.canvas.selected_annotation_id = None
         self.clear_attribute_panel(refresh_sample_panel=False)
+        self.update_selected_class_status()
         
         # 检查图片是否还有标注
         remaining_annotations = self.annotations
@@ -6494,25 +6553,56 @@ class AnnotatePage(QWidget):
             self.class_list.setCurrentRow(self.class_list.count() - 1)
             self.on_class_selected()
     
+    def _visible_image_ids(self) -> List[int]:
+        """返回左侧图片列表中当前可见（未被筛选隐藏）的图片 id，按列表显示顺序。
+
+        导航与状态栏都基于它，保证「翻页顺序 / 当前位置」与筛选后的左栏一致。
+        """
+        if not hasattr(self, 'image_list'):
+            return []
+        ids = []
+        for i in range(self.image_list.count()):
+            item = self.image_list.item(i)
+            if item is not None and not item.isHidden():
+                ids.append(item.data(Qt.ItemDataRole.UserRole))
+        return ids
+
+    def _select_first_visible_image(self):
+        """筛选后默认选中可见集的第一张并滚动到它（无可见项则不动）。"""
+        visible = self._visible_image_ids()
+        if not visible:
+            return
+        self.load_image(visible[0])
+
     def prev_image(self):
-        """上一张图片"""
-        if not self.images or not self.current_image_id:
+        """上一张图片（按左栏筛选后可见列表的顺序）"""
+        if not self.current_image_id:
             return
-        
-        current_index = next((i for i, img in enumerate(self.images) if img['id'] == self.current_image_id), 0)
-        if current_index > 0:
-            new_image_id = self.images[current_index - 1]['id']
-            self.load_image(new_image_id)
-    
+        visible = self._visible_image_ids()
+        if not visible:
+            return
+        if self.current_image_id in visible:
+            pos = visible.index(self.current_image_id)
+            if pos > 0:
+                self.load_image(visible[pos - 1])
+        else:
+            # 当前图被筛选隐藏，跳到可见列表最后一张
+            self.load_image(visible[-1])
+
     def next_image(self):
-        """下一张图片"""
-        if not self.images or not self.current_image_id:
+        """下一张图片（按左栏筛选后可见列表的顺序）"""
+        if not self.current_image_id:
             return
-        
-        current_index = next((i for i, img in enumerate(self.images) if img['id'] == self.current_image_id), -1)
-        if current_index < len(self.images) - 1:
-            new_image_id = self.images[current_index + 1]['id']
-            self.load_image(new_image_id)
+        visible = self._visible_image_ids()
+        if not visible:
+            return
+        if self.current_image_id in visible:
+            pos = visible.index(self.current_image_id)
+            if pos < len(visible) - 1:
+                self.load_image(visible[pos + 1])
+        else:
+            # 当前图被筛选隐藏，跳到可见列表第一张
+            self.load_image(visible[0])
     
     def add_history(self, action: str, data: dict):
         """添加历史记录"""
@@ -6567,11 +6657,18 @@ class AnnotatePage(QWidget):
         self.update_sample_control_panel()
     
     def update_status_bar(self):
-        """更新状态栏，并顺带刷新顶部信息条和按钮可用性。"""
-        total = len(self.images)
-        annotated = sum(1 for img in self.images if img.get('status') == 'annotated')
-        index = self._current_image_index()
-        current = index + 1 if index >= 0 else 0
+        """更新状态栏，并顺带刷新顶部信息条和按钮可用性。
+
+        位置与计数均基于左侧筛选后的可见图片集，与导航顺序保持一致。
+        """
+        visible = self._visible_image_ids()
+        total = len(visible)
+        status_map = {img['id']: img.get('status') for img in self.images}
+        annotated = sum(1 for iid in visible if status_map.get(iid) == 'annotated')
+        if self.current_image_id in visible:
+            current = visible.index(self.current_image_id) + 1
+        else:
+            current = 0
 
         self.status_image.setText(f"当前: {current}/{total}")
         self.status_progress.setText(f"标注: {annotated}/{total}")
