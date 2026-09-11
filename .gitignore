@@ -4,6 +4,7 @@ projects/
 runs/
 datasets/
 data/
+outputs/
 
 # 开发和临时文件
 .git/

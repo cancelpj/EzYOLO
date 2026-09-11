@@ -248,7 +248,14 @@ class TrainingThread(QThread):
     def run_real_training(self):
         """运行真实YOLO训练"""
         from ultralytics import YOLO
-        
+
+        # 打印版本，方便排查不同版本之间的接口差异
+        try:
+            import ultralytics
+            self.log_message.emit(f"  - Ultralytics 版本: {ultralytics.__version__}")
+        except Exception:
+            pass
+
         # 构建模型名称
         model_prefix = self.config['model_prefix']
         model_size = self.config['model_size']
@@ -342,51 +349,88 @@ class TrainingThread(QThread):
                 self.epoch_started.emit(epoch, total_epochs)
                 self.log_message.emit(f"\n[Epoch {epoch}/{total_epochs}] 开始训练...")
             
+            def to_scalar(value):
+                """把张量/数组转成 Python 标量，转不了就原样返回。"""
+                if hasattr(value, 'item') and callable(getattr(value, 'item')):
+                    try:
+                        return value.item()
+                    except Exception:
+                        return value
+                return value
+
+            def read_loss(trainer, name, index):
+                """读取本轮训练损失。
+
+                不同版本的 Ultralytics 里 loss_items / tloss 既可能是
+                {'box_loss': tensor, ...} 这样的字典，也可能是 [tensor, ...] 这样的序列，
+                这里两种写法都兼容，取不到就返回 0。
+                """
+                for attr in ('tloss', 'loss_items'):
+                    data = getattr(trainer, attr, None)
+                    if not data:
+                        continue
+                    try:
+                        if isinstance(data, dict):
+                            if name in data:
+                                return to_scalar(data[name]) or 0
+                            # 兼容 {'train/box_loss': ...} 这种带前缀的键
+                            for key, value in data.items():
+                                if str(key).endswith(name):
+                                    return to_scalar(value) or 0
+                        elif index < len(data):
+                            return to_scalar(data[index]) or 0
+                    except Exception:
+                        continue
+                return 0
+
+            def read_val_metric(trainer, *keys):
+                """读取最新一次验证指标（mAP50 / mAP50-95）。"""
+                sources = []
+                train_metrics = getattr(trainer, 'metrics', None)
+                if isinstance(train_metrics, dict):
+                    sources.append(train_metrics)
+                validator = getattr(trainer, 'validator', None)
+                results_dict = getattr(getattr(validator, 'metrics', None), 'results_dict', None)
+                if isinstance(results_dict, dict):
+                    sources.append(results_dict)
+                for source in sources:
+                    for key in keys:
+                        if key in source:
+                            return to_scalar(source[key]) or 0
+                return 0
+
             def on_train_epoch_end(trainer):
                 """每个epoch结束时调用"""
                 epoch = trainer.epoch + 1
-                
+
                 # 获取训练指标
-                metrics = {}
-                if hasattr(trainer, 'loss_items'):
-                    # 确保将张量转换为标量
-                    def to_scalar(value):
-                        import torch
-                        if isinstance(value, torch.Tensor):
-                            return value.item()
-                        return value
-                    
-                    metrics['box_loss'] = to_scalar(trainer.loss_items[0]) if len(trainer.loss_items) > 0 else 0
-                    metrics['cls_loss'] = to_scalar(trainer.loss_items[1]) if len(trainer.loss_items) > 1 else 0
-                    metrics['dfl_loss'] = to_scalar(trainer.loss_items[2]) if len(trainer.loss_items) > 2 else 0
-                
-                # 获取验证指标 - 使用results_dict属性
-                if hasattr(trainer, 'validator') and trainer.validator:
-                    val_metrics = trainer.validator.metrics
-                    if val_metrics and hasattr(val_metrics, 'results_dict'):
-                        results_dict = val_metrics.results_dict
-                        # 确保将张量转换为标量
-                        def to_scalar(value):
-                            import torch
-                            if isinstance(value, torch.Tensor):
-                                return value.item()
-                            return value
-                        metrics['map50'] = to_scalar(results_dict.get('metrics/mAP50(B)', 0))
-                        metrics['map50_95'] = to_scalar(results_dict.get('metrics/mAP50-95(B)', 0))
-                
-                metrics['epoch'] = epoch
+                # 回调里抛异常会直接中断整个训练，这里兜底：读不到指标也只记轮次
+                try:
+                    metrics = {
+                        'epoch': epoch,
+                        'box_loss': read_loss(trainer, 'box_loss', 0),
+                        'cls_loss': read_loss(trainer, 'cls_loss', 1),
+                        'dfl_loss': read_loss(trainer, 'dfl_loss', 2),
+                        # 这里拿到的是上一轮验证的结果，本轮的 mAP 由 on_fit_epoch_end 回填
+                        'map50': read_val_metric(trainer, 'metrics/mAP50(B)', 'mAP50(B)'),
+                        'map50_95': read_val_metric(trainer, 'metrics/mAP50-95(B)', 'mAP50-95(B)'),
+                    }
+                except Exception as e:
+                    self.log_message.emit(f"  ⚠ 读取训练指标失败（{e}），本轮仅记录轮次")
+                    metrics = {
+                        'epoch': epoch, 'box_loss': 0, 'cls_loss': 0,
+                        'dfl_loss': 0, 'map50': 0, 'map50_95': 0,
+                    }
+
                 self.metrics_history.append(metrics)
                 self.epoch_finished.emit(epoch, metrics)
                 self.metrics_updated.emit(metrics)
-                
+
                 # 输出训练信息
                 loss_str = f"box_loss: {metrics.get('box_loss', 0):.4f}, cls_loss: {metrics.get('cls_loss', 0):.4f}"
                 if metrics.get('dfl_loss'):
                     loss_str += f", dfl_loss: {metrics['dfl_loss']:.4f}"
                 self.log_message.emit(f"  训练损失 - {loss_str}")
-                
-                if metrics.get('map50'):
-                    self.log_message.emit(f"  验证指标 - mAP50: {metrics['map50']:.4f}, mAP50-95: {metrics.get('map50_95', 0):.4f}")
 
                 # 用户点了停止：让 Ultralytics 在本轮收尾后自己退出循环。
                 # 界面线程因此不需要 wait() 干等到整个训练跑完。
@@ -395,12 +439,35 @@ class TrainingThread(QThread):
                     self.log_message.emit("已收到停止请求，本轮结束后停止训练")
 
             def on_fit_epoch_end(trainer):
-                """每个fit epoch结束时调用（包含验证）"""
-                pass
-            
+                """每个fit epoch结束时调用（验证已完成），回填本轮真实的 mAP。
+
+                回调里抛异常会直接中断整个训练，所以这里整体兜底。
+                """
+                try:
+                    if not self.metrics_history:
+                        return
+                    # 训练结束后还会再跑一次最终验证（此时 epoch 已被 +1），不再回填历史
+                    total_epochs = getattr(trainer, 'epochs', 0) or 0
+                    if total_epochs and trainer.epoch + 1 > total_epochs:
+                        return
+                    latest = self.metrics_history[-1]
+                    map50 = read_val_metric(trainer, 'metrics/mAP50(B)', 'mAP50(B)')
+                    map50_95 = read_val_metric(trainer, 'metrics/mAP50-95(B)', 'mAP50-95(B)')
+                    if not map50 and not map50_95:
+                        return
+                    latest['map50'] = map50
+                    latest['map50_95'] = map50_95
+                    self.metrics_updated.emit(dict(latest))
+                    self.log_message.emit(
+                        f"  验证指标 - mAP50: {map50:.4f}, mAP50-95: {map50_95:.4f}"
+                    )
+                except Exception as e:
+                    self.log_message.emit(f"  ⚠ 回填验证指标失败（{e}）")
+
             # 注册回调
             model.add_callback('on_train_epoch_start', on_train_epoch_start)
             model.add_callback('on_train_epoch_end', on_train_epoch_end)
+            model.add_callback('on_fit_epoch_end', on_fit_epoch_end)
             
             # 开始训练
             self.log_message.emit("=" * 60)
@@ -2696,6 +2763,13 @@ class TrainPage(QWidget):
     
     def on_metrics_updated(self, metrics: dict):
         """指标更新 - 实时更新曲线"""
+        # 验证跑完后会把本轮的 mAP 回填进同一轮记录，这里同步到历史里再重绘
+        epoch = metrics.get('epoch')
+        if epoch is not None:
+            for record in reversed(self.training_history):
+                if record['epoch'] == epoch:
+                    record['metrics'].update(metrics)
+                    break
         self.update_plots()
     
     def clear_plots(self):
