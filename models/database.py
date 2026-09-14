@@ -40,6 +40,8 @@ class Database:
         """获取数据库连接的上下文管理器"""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # SQLite 默认不开启外键约束，ON DELETE CASCADE 形同虚设；必须显式打开
+        conn.execute("PRAGMA foreign_keys = ON")
         try:
             yield conn
             conn.commit()
@@ -296,9 +298,17 @@ class Database:
             return cursor.rowcount > 0
     
     def delete_project(self, project_id: int) -> bool:
-        """删除项目"""
+        """删除项目（级联删除所有图片记录和标注）"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            # 先删子表：annotations → images → projects
+            # 顺序不能颠倒，因为 foreign_keys = ON 时 SQLite 要求从子到父删
+            cursor.execute(
+                "DELETE FROM annotations WHERE image_id IN "
+                "(SELECT id FROM images WHERE project_id = ?)",
+                (project_id,),
+            )
+            cursor.execute("DELETE FROM images WHERE project_id = ?", (project_id,))
             cursor.execute("DELETE FROM projects WHERE id = ?", (project_id,))
             return cursor.rowcount > 0
     
