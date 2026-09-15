@@ -45,10 +45,11 @@ THEME_SETTING_KEY = 'theme'
 # (设置键, 显示名, 默认键位)
 SHORTCUTS = [
     ("rect_tool_shortcut", "矩形工具", "W"),
-    ("poly_tool_shortcut", "多边形工具", "P"),
-    ("move_tool_shortcut", "移动工具", "V"),
+    ("poly_tool_shortcut", "多边形工具", "Q"),
+    ("move_tool_shortcut", "移动工具", "E"),
     ("prev_image_shortcut", "上一张图片", "A"),
     ("next_image_shortcut", "下一张图片", "D"),
+    ("apply_class_shortcut", "改为选中类别", "S"),
     ("delete_shortcut", "删除标注", "DELETE"),
     ("reset_view_shortcut", "重置视图", "R"),
 ]

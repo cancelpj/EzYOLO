@@ -2922,8 +2922,9 @@ class AnnotatePage(QWidget):
             'prev': str(settings.value("prev_image_shortcut", "A")).upper(),
             'next': str(settings.value("next_image_shortcut", "D")).upper(),
             'rect': str(settings.value("rect_tool_shortcut", "W")).upper(),
-            'poly': str(settings.value("poly_tool_shortcut", "P")).upper(),
-            'move': str(settings.value("move_tool_shortcut", "V")).upper(),
+            'poly': str(settings.value("poly_tool_shortcut", "Q")).upper(),
+            'move': str(settings.value("move_tool_shortcut", "E")).upper(),
+            'apply_class': str(settings.value("apply_class_shortcut", "S")).upper(),
             'delete': str(settings.value("delete_shortcut", "DELETE")).upper(),
         }
 
@@ -2944,6 +2945,10 @@ class AnnotatePage(QWidget):
             self.btn_delete.setToolTip(
                 f"删除当前选中的标注\n快捷键: {keys['delete']}\n下拉菜单里可以删除整张图片"
             )
+        if hasattr(self, 'btn_apply_attr'):
+            self.btn_apply_attr.setToolTip(
+                f"把画布上选中的那个标注，改成当前选中的类别\n快捷键: {keys['apply_class']}"
+            )
         if hasattr(self, 'btn_draw_tool'):
             self.refresh_draw_tool_button()
 
@@ -2954,6 +2959,7 @@ class AnnotatePage(QWidget):
             f"{keys['poly']}　多边形",
             f"{keys['move']}　移动",
             "1-9　切换类别",
+            f"{keys['apply_class']}　改为选中类别",
             f"{keys['delete']}　删除标注",
             "Ctrl+Z　撤销",
         ])
@@ -3582,7 +3588,9 @@ class AnnotatePage(QWidget):
 
         # 只有「选中了一个标注、且选的类别和它现在的不一样」时才可点
         self.btn_apply_attr = QPushButton("改为选中类别")
-        self.btn_apply_attr.setToolTip("把画布上选中的那个标注，改成当前选中的类别")
+        self.btn_apply_attr.setToolTip(
+            "把画布上选中的那个标注，改成当前选中的类别\n快捷键: S"
+        )
         self.btn_apply_attr.clicked.connect(self.apply_annotation_changes)
         self.btn_apply_attr.setEnabled(False)
 
@@ -6798,10 +6806,11 @@ class AnnotatePage(QWidget):
         # 获取快捷键设置
         settings = QSettings("EzYOLO", "Settings")
         rect_tool_key = str(settings.value("rect_tool_shortcut", "W"))
-        poly_tool_key = str(settings.value("poly_tool_shortcut", "P"))
-        move_tool_key = str(settings.value("move_tool_shortcut", "V"))
+        poly_tool_key = str(settings.value("poly_tool_shortcut", "Q"))
+        move_tool_key = str(settings.value("move_tool_shortcut", "E"))
+        apply_class_key = str(settings.value("apply_class_shortcut", "S"))
         delete_key = str(settings.value("delete_shortcut", "DELETE"))
-        
+
         # 处理工具快捷键（按键码比对，DELETE/SPACE/方向键这些没有字符的键才认得出来）
         key_text = event.text().upper()
         if event_matches_shortcut(event, rect_tool_key):
@@ -6813,6 +6822,9 @@ class AnnotatePage(QWidget):
         elif event_matches_shortcut(event, move_tool_key):
             self.btn_move.setChecked(True)
             self.set_tool('move')
+            return
+        elif event_matches_shortcut(event, apply_class_key):
+            self.apply_annotation_changes()
             return
         elif event_matches_shortcut(event, delete_key):
             self.delete_selected_annotation()
