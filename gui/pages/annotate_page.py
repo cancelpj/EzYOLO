@@ -5981,14 +5981,16 @@ class AnnotatePage(QWidget):
         # 加载标注
         self.load_annotations()
 
-        # 默认高亮选中第一个标注框，便于一眼看到它属于哪个类别
-        if self.annotations:
+        # 默认高亮选中第一个标注框——但只在「移动」模式下做这件事。
+        # 「画方框」等绘制工具下保持无选中状态，避免选中框干扰绘制意图
+        # （例如：误以为点的是改尺寸，其实是画新框）。
+        if self.canvas.current_tool == 'move' and self.annotations:
             first = self.annotations[0]
             self.canvas.selected_annotation_id = first['id']
             self.canvas.annotation_selected.emit(first['id'])
             self.canvas.update()
 
-        # 同步状态栏的「选中框类别」显示（无标注时显示未选择）
+        # 同步状态栏的「选中框类别」显示（有选中框时显示类别，否则显示未选择）
         self.update_selected_class_status()
 
         # 更新状态栏
