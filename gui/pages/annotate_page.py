@@ -6287,10 +6287,12 @@ class AnnotatePage(QWidget):
         if updated_annotation:
             self.update_attribute_panel(updated_annotation)
         self.canvas.update()
+        # 状态栏「选中框: xxx」也要同步刷新——load_annotations 已重读 self.annotations，
+        # 这里再读一次就能拿到改后的新类别显示。
+        self.update_selected_class_status()
         self._invalidate_sample_stats_cache()
         self.update_sample_control_panel()
-        
-        QMessageBox.information(self, "成功", "标注修改已保存")
+        # 静默保存，不再弹"成功"提示框——画布/状态栏已有视觉反馈，再弹反而打断标注意图。
 
     def delete_random_samples_for_target(self):
         """按目标标签随机删除样本图像"""
