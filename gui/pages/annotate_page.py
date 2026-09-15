@@ -5851,30 +5851,17 @@ class AnnotatePage(QWidget):
         self._refresh_annotation_class_controls()
 
     def _rebuild_image_filter_options(self):
-        """按当前项目类别，动态重建左侧图片筛选下拉：固定项 + 每个类别一项（带含该类别图片数）。"""
+        """按当前项目类别，动态重建左侧图片筛选下拉：固定项 + 每个类别一项。"""
         if not hasattr(self, 'image_filter'):
             return
         prev = self.image_filter.currentText()
-        # 各类别「包含该类别的图片数」（与筛选语义一致：按图片去重）
-        counts = {}
-        if self.current_project_id:
-            try:
-                counts = db.get_project_image_counts_by_class(self.current_project_id)
-            except Exception:
-                counts = {}
         self.image_filter.blockSignals(True)
         self.image_filter.clear()
         self.image_filter.addItem("全部")
         self.image_filter.addItem("未标注")
         self.image_filter.addItem("已标注")
         for cls in self.classes:
-            cid = cls['id']
-            try:
-                cid = int(cid)
-            except (TypeError, ValueError):
-                cid = cls['id']
-            n = counts.get(cid, 0)
-            self.image_filter.addItem(f"类别: {cls['name']} ({n})", cls['id'])
+            self.image_filter.addItem(f"类别: {cls['name']}", cls['id'])
         self.image_filter.blockSignals(False)
         # 尽量还原之前的筛选项；不存在（如类别被改名/删除）则退回「全部」
         idx = self.image_filter.findText(prev)
