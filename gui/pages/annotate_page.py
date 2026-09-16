@@ -5876,6 +5876,8 @@ class AnnotatePage(QWidget):
         self.image_filter.setCurrentIndex(idx if idx >= 0 else 0)
         # 显式应用一次筛选，确保重建后图片列表与当前筛选项一致
         self.filter_images(self.image_filter.currentText())
+        # 同步 prev 记录——重建后的 currentText 是 on_image_filter_changed 下一个 prev
+        self._previous_filter_text = self.image_filter.currentText()
 
     def filter_images(self, filter_text: str):
         """筛选图片"""
@@ -5917,8 +5919,43 @@ class AnnotatePage(QWidget):
 
     def on_image_filter_changed(self, filter_text: str):
         """筛选条件改变：先刷新左栏可见项，再默认选中可见集第一张（滚动跟随）。"""
+        prev_text = getattr(self, '_previous_filter_text', '全部')
+
         self.filter_images(filter_text)
+
+        # 类别筛选且 0 张图：弹提示并把下拉回退到上一项，不跳图、不改当前选中。
+        if filter_text.startswith('类别: ') and not self._visible_image_ids():
+            QMessageBox.warning(
+                self, "提示",
+                "该类别下还没有图片，请先标注几张再切换。"
+            )
+            self._restore_filter_without_signal(prev_text)
+            self._previous_filter_text = prev_text
+            return
+
         self._select_first_visible_image()
+        self._previous_filter_text = filter_text
+
+    def _restore_filter_without_signal(self, text: str):
+        """把下拉恢复到指定项并应用对应筛选，但不重新触发 currentTextChanged。
+
+        用于「类别筛选 0 张图」弹框确认后回退到 prev 项——直接调 filter_images 不会触发
+        on_image_filter_changed（信号是被切当前项触发的），所以一次静默 setCurrentIndex +
+        filter_images 就能恢复视觉与左栏隐藏状态。
+        """
+        if not hasattr(self, 'image_filter'):
+            return
+        idx = self.image_filter.findText(text)
+        if idx < 0:
+            # prev 项已经不在了（项目切换/类别重建后），退回到「全部
+            idx = self.image_filter.findText('全部')
+            if idx < 0 and self.image_filter.count() > 0:
+                idx = 0
+        self.image_filter.blockSignals(True)
+        if idx >= 0:
+            self.image_filter.setCurrentIndex(idx)
+        self.image_filter.blockSignals(False)
+        self.filter_images(self.image_filter.currentText())
 
     def on_image_selected(self, item: QListWidgetItem):
         """图片选中事件"""
