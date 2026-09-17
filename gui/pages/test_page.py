@@ -803,6 +803,7 @@ class TestPage(QWidget):
         self._stopping = False
         self._model_note = ""  # 模型来源那一行的补充说明
         self._model_user_chosen = False  # 用户自己挑过模型文件，别再被默认值盖掉
+        self._using_official_pretrained = False  # 是否明确切换到官方预训练模式
         self.output_root = Path(__file__).parent.parent.parent / "outputs"
         self.image_output_dir = self.output_root / "test_images"
         self.video_output_dir = self.output_root / "test_videos"
@@ -868,7 +869,9 @@ class TestPage(QWidget):
             self.current_project = None
             self.model_path = None
             self._model_note = "还没有选择项目"
+            self._using_official_pretrained = False
             self._update_model_summary()
+            self._update_advanced_section_enabled()
             print("[TestPage] 项目已取消选择")
 
         self.refresh_data_group_combo()
@@ -876,11 +879,15 @@ class TestPage(QWidget):
 
     def set_default_model_path(self):
         """选用本项目训练产出的模型（runs/**/exp_<id>/weights/best.pt）。"""
+        # 用户点这个按钮 = 主动放弃之前手动选的模型，也退出官方预训练模式
+        self._model_user_chosen = False
+        self._using_official_pretrained = False
         if not self.current_project_id:
             self.model_path = None
             self._model_note = "还没有选择项目"
             self._update_model_summary()
             self._update_ready_state()
+            self._update_advanced_section_enabled()
             return
 
         weights = find_project_weights(self.current_project_id)
@@ -894,6 +901,7 @@ class TestPage(QWidget):
 
         self._update_model_summary()
         self._update_ready_state()
+        self._update_advanced_section_enabled()
 
     # ==================== 界面 ====================
 
@@ -907,7 +915,7 @@ class TestPage(QWidget):
         splitter.setChildrenCollapsible(False)
 
         setup_panel = self.create_setup_panel()
-        setup_panel.setMinimumWidth(300)
+        setup_panel.setMinimumWidth(420)
         splitter.addWidget(setup_panel)
 
         result_panel = self.create_result_panel()
@@ -916,13 +924,15 @@ class TestPage(QWidget):
 
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([320, 520])
+        splitter.setSizes([460, 460])
 
         main_layout.addWidget(splitter)
 
         self.refresh_data_group_combo()
         self._update_model_summary()
         self._update_ready_state()
+        # 初始未进入官方预训练模式 → 高级设置默认禁用（需求：只有切到该模式才允许展开）
+        self._update_advanced_section_enabled()
 
     def create_setup_panel(self) -> QWidget:
         """左栏：三步设置（可滚动）+ 常驻的运行区。"""
@@ -1001,10 +1011,38 @@ class TestPage(QWidget):
         self.btn_select_model.clicked.connect(self.select_model)
         btn_row.addWidget(self.btn_select_model)
 
+        self.btn_clear_model = QPushButton("用官方预训练模型")
+        self.btn_clear_model.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_model.clicked.connect(self.use_official_pretrained)
+        self.btn_clear_model.setVisible(True)
+        btn_row.addWidget(self.btn_clear_model)
+
         btn_row.addStretch()
         body.addLayout(btn_row)
 
         return card
+
+    def use_official_pretrained(self):
+        """切换到官方预训练模式，重置自定义模型并启用高级设置。"""
+        self.model_path = None
+        self._model_note = "使用官方预训练模型"
+        self._model_user_chosen = False
+        self._using_official_pretrained = True
+        self._update_model_summary()
+        self._update_ready_state()
+        self._update_advanced_section_enabled()
+        self.log_message("已切换到官方预训练模型")
+
+    def _update_advanced_section_enabled(self):
+        """根据当前模式控制官方预训练设置的可用性与展开态。"""
+        if not hasattr(self, 'advanced'):
+            return
+        # 只在官方预训练模式下启用
+        enabled = self._using_official_pretrained
+        self.advanced.toggle.setEnabled(enabled)
+        self.advanced.content.setEnabled(enabled)
+        # 离开官方预训练模式时自动收起；进入时展开便于配置
+        self.advanced.set_expanded(enabled)
 
     def create_source_card(self) -> QFrame:
         """② 拿什么去测。"""
@@ -1096,7 +1134,7 @@ class TestPage(QWidget):
 
         body.addLayout(form)
 
-        advanced = CollapsibleSection("高级设置")
+        self.advanced = CollapsibleSection("官方预训练模型设置")
 
         adv_form = QFormLayout()
         adv_form.setContentsMargins(0, 0, 0, 0)
@@ -1115,7 +1153,7 @@ class TestPage(QWidget):
         self.inference_size.setSingleStep(32)
         adv_form.addRow("推理尺寸:", self.inference_size)
 
-        advanced.content_layout().addLayout(adv_form)
+        self.advanced.content_layout().addLayout(adv_form)
 
         pretrained_form = QFormLayout()
         pretrained_form.setContentsMargins(0, 0, 0, 0)
@@ -1123,6 +1161,9 @@ class TestPage(QWidget):
 
         self.model_version = QComboBox()
         self.model_version.addItems(sorted(ULTRALYTICS_MODELS.keys()))
+        # 默认选中 YOLOv26（在连接信号之前设定，避免初始化时触发 on_version_changed）
+        if "YOLOv26" in ULTRALYTICS_MODELS:
+            self.model_version.setCurrentText("YOLOv26")
         self.model_version.setToolTip("没有选模型时会退回这里选的官方预训练模型")
         self.model_version.currentTextChanged.connect(self.on_version_changed)
         pretrained_form.addRow("版本:", self.model_version)
@@ -1134,7 +1175,7 @@ class TestPage(QWidget):
         self.task_type.setToolTip("决定 ONNX / TensorRT 模型怎么加载")
         pretrained_form.addRow("任务:", self.task_type)
 
-        advanced.content_layout().addLayout(pretrained_form)
+        self.advanced.content_layout().addLayout(pretrained_form)
 
         # 先填好型号/任务，再接「选择变了就刷新模型说明」的信号，避免初始化时反复触发
         self._init_model_lists()
@@ -1142,9 +1183,9 @@ class TestPage(QWidget):
         self.model_size.currentIndexChanged.connect(self._on_pretrained_changed)
         self.task_type.currentIndexChanged.connect(self._on_pretrained_changed)
 
-        advanced.content_layout().addWidget(self.create_class_mapping_block())
+        self.advanced.content_layout().addWidget(self.create_class_mapping_block())
 
-        body.addWidget(advanced)
+        body.addWidget(self.advanced)
 
         return card
 
@@ -1399,7 +1440,7 @@ class TestPage(QWidget):
         return f"{prefix}{model_size}-{suffix}.pt"
 
     def _on_pretrained_changed(self, *_args):
-        """高级设置里换了预训练模型：把「现在会用哪个模型」这句话跟着改。"""
+        """官方预训练模型设置里换了预训练模型：把「现在会用哪个模型」这句话跟着改。"""
         self._update_model_summary()
         self._update_ready_state()
 
@@ -1434,6 +1475,9 @@ class TestPage(QWidget):
         if self._model_note:
             hint = f"{self._model_note}；{hint}"
         self.model_source_label.setText(hint)
+        # 用官方预训练模型：始终显示，供用户随时切过去
+        if hasattr(self, 'btn_clear_model'):
+            self.btn_clear_model.setVisible(True)
         self.model_source_label.setToolTip(
             "官方预训练模型首次运行会自动下载，只认通用类别，不是你训练的模型"
         )
@@ -1533,8 +1577,10 @@ class TestPage(QWidget):
             self.model_path = file_path
             self._model_note = "手动选择的模型文件"
             self._model_user_chosen = True
+            self._using_official_pretrained = False
             self._update_model_summary()
             self._update_ready_state()
+            self._update_advanced_section_enabled()
             self.log_message(f"已选择模型: {file_path}")
 
             # 根据模型类型给出提示
