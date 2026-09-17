@@ -138,6 +138,19 @@ CONFIG_PANEL_EXPANDED_WIDTH = 360
 CONFIG_PANEL_COLLAPSED_WIDTH = 220
 
 
+def _device_options():
+    """按真实 GPU 数量生成设备下拉项；无 torch 或未检测到可用 GPU 时仅保留自动选择/CPU。"""
+    items = ["自动选择", "CPU"]
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                items.append(f"CUDA:{i}")
+    except Exception:
+        pass
+    return items
+
+
 class NoWheelSpinBox(QSpinBox):
     """未聚焦时忽略滚轮，交给外层滚动区域处理。"""
 
@@ -1166,7 +1179,7 @@ class TrainPage(QWidget):
         form.addRow("训练轮数:", self.epochs)
 
         self.device = NoWheelComboBox()
-        self.device.addItems(["自动选择", "CPU", "CUDA:0", "CUDA:1", "CUDA:2", "CUDA:3"])
+        self.device.addItems(_device_options())
         self.device.setToolTip("自动选择：有 NVIDIA 显卡就用显卡，没有就用 CPU（会慢很多）。")
         form.addRow("计算设备:", self.device)
         self.refresh_remote_targets()

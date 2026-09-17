@@ -54,6 +54,19 @@ def annotated_output_path(source_path: str, image_dir: Path, video_dir: Path) ->
 from gui.pages.train_page import ULTRALYTICS_MODELS, TASK_NAMES, SIZE_NAMES
 
 
+def _device_options():
+    """按真实 GPU 数量生成设备下拉项；无 torch 或未检测到可用 GPU 时仅保留自动选择/CPU。"""
+    items = ["自动选择", "CPU"]
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                items.append(f"CUDA:{i}")
+    except Exception:
+        pass
+    return items
+
+
 class InferenceThread(QThread):
     """推理后台线程"""
     
@@ -1128,7 +1141,7 @@ class TestPage(QWidget):
         form.addRow("识别门槛:", self.conf_threshold)
 
         self.inference_device = QComboBox()
-        self.inference_device.addItems(["自动选择", "CPU", "CUDA:0", "CUDA:1", "CUDA:2", "CUDA:3"])
+        self.inference_device.addItems(_device_options())
         self.inference_device.setToolTip("保持「自动选择」即可")
         form.addRow("运行设备:", self.inference_device)
 
