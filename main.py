@@ -8,6 +8,15 @@ EzYOLO - 本地YOLO全流程训练软件
 import sys
 import os
 from pathlib import Path
+
+# 关闭 Ultralytics 的“依赖自动安装”：
+# 本项目用 onnxruntime-directml 提供 DML 加速，而 Ultralytics 会把“缺少 onnxruntime 发行包”误判为
+# 需要安装 CPU 版 onnxruntime（二者争抢同一个顶层包名）。自动安装会用 CPU 版覆盖 directml，
+# 导致 DmlExecutionProvider 失效。因此禁用其自动安装，导出 ONNX 所需的 onnx / onnxslim 由
+# requirements.txt 显式安装。setdefault 保证若用户主动开启则尊重其设置。
+os.environ.setdefault("YOLO_AUTOINSTALL", "0")
+os.environ.setdefault("ULTRALYTICS_SKIP_REQUIREMENTS_CHECKS", "1")
+
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt, qInstallMessageHandler, QtMsgType
 from PyQt6.QtGui import QIcon

@@ -1,9 +1,12 @@
 PyQt6
-opencv-python
+opencv-python==4.11.0.86
 Pillow
-ultralytics
+ultralytics==8.4.154
 torch
 torchvision
+onnxruntime-directml==1.24.4   # 提供 DmlExecutionProvider；版本须与 ultralytics 8.4.154 兼容（勿升 1.30.x，会引发 is_webgpu_graph_capture_enabled 崩溃）
+onnx>=1.16.0,<2.0.0   # ONNX 导出所需（序列化库，与 onnxruntime-directml 不冲突）
+onnxslim>=0.1.82       # Ultralytics ONNX 导出后处理所需
 pyqtgraph
 matplotlib
 numpy

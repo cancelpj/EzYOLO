@@ -54,14 +54,218 @@ def annotated_output_path(source_path: str, image_dir: Path, video_dir: Path) ->
 from gui.pages.train_page import ULTRALYTICS_MODELS, TASK_NAMES, SIZE_NAMES
 
 
+# ---------------------------------------------------------------------------
+# DirectML 补丁
+#
+# ultralytics 的 ONNX 后端（ultralytics/nn/backends/onnx.py）只认
+# CUDA / MPS，其余一律硬编码成 CPUExecutionProvider；而且它的
+# select_device() 会直接拒绝字符串 'dml'（报 "Invalid CUDA 'device=dml'
+# requested"）。因此把 device='dml' 传给 model() 必然让每张图推理失败。
+#
+# 这里在模型加载后，把 ONNX 会话重新绑定到 DmlExecutionProvider，从而真正
+# 走 DirectML GPU 加速；同时给 ultralytics 传 device='cpu'（它唯一接受的
+# 合法占位值）。这样既拿到加速，又不触发崩溃，且复用 ultralytics 自己的
+# NMS / 缩放 / 绘图。
+# ---------------------------------------------------------------------------
+_DML_PATCH_INSTALLED = False
+_DML_DESIRED = False
+
+
+def _set_dml_desired(value: bool):
+    """设置本次推理是否希望使用 DirectML（供补丁读取）。"""
+    global _DML_DESIRED
+    _DML_DESIRED = bool(value)
+
+
+def _install_dml_patch():
+    """给 ultralytics 的 ONNX 后端打补丁：加载模型后把会话绑定到 DmlExecutionProvider。
+
+    幂等：多次调用只会安装一次。若补丁失败（例如 ultralytics 内部结构变动），
+    不影响后续的 CPU 推理。
+    """
+    global _DML_PATCH_INSTALLED, _DML_DESIRED
+    _DML_DESIRED = True
+    if _DML_PATCH_INSTALLED:
+        return
+    try:
+        import onnxruntime as _ort
+        from ultralytics.nn.backends.onnx import ONNXBackend
+        from ultralytics.utils import LOGGER
+
+        _orig_load = ONNXBackend.load_model
+
+        def _dml_wrapped(self, weight):
+            # 先按 ultralytics 原有逻辑加载（CUDA/MPS/CPU 判定、metadata、
+            # dynamic 检测、io binding 设置等都由它完成）
+            _orig_load(self, weight)
+            # 仅当本次推理希望用 DML、且运行环境确实提供该 provider 时，
+            # 用 DmlExecutionProvider 重新创建会话（替换掉原 CPU 会话）
+            if _DML_DESIRED and "DmlExecutionProvider" in _ort.get_available_providers():
+                try:
+                    self.session = _ort.InferenceSession(
+                        str(weight),
+                        self.session_options,
+                        providers=["DmlExecutionProvider", "CPUExecutionProvider"],
+                    )
+                    LOGGER.info("已为 ONNX 会话绑定 DmlExecutionProvider（DirectML 加速）")
+                except Exception as e:  # 绑定失败则保持 CPU，不中断推理
+                    LOGGER.warning(f"DmlExecutionProvider 绑定失败，回退 CPU: {e}")
+
+        ONNXBackend.load_model = _dml_wrapped
+        _DML_PATCH_INSTALLED = True
+    except Exception as e:
+        # 打补丁失败不应阻断 CPU 推理
+        print(f"[EzYOLO] DML 补丁安装失败（不影响 CPU 推理）: {e}")
+
+
+def _enumerate_dml_adapters():
+    """枚举支持 DirectML 的 DXGI 硬件适配器（排除 WARP 软件适配器）。
+
+    返回 ['DirectML:0 (名称)', ...]，失败时返回 []。仅 Windows 有效。
+    直接用 ctypes 调系统 DXGI，避免引入额外依赖；任何异常都静默降级为空列表。
+    """
+    import sys
+    if not sys.platform.startswith("win"):
+        return []
+    try:
+        import ctypes
+        from ctypes import POINTER, byref, c_void_p, c_size_t, c_int, c_long
+        from ctypes import wintypes
+
+        dxgi = ctypes.windll.dxgi
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_uint32),
+                ("Data2", ctypes.c_uint16),
+                ("Data3", ctypes.c_uint16),
+                ("Data4", ctypes.c_uint8 * 8),
+            ]
+
+        def guid_from_hex(h):
+            # GUID 文本的前 3 段按大端解释（标准 GUID 布局），Data4 按字节原样
+            b = bytes.fromhex(h)
+            return GUID(
+                int.from_bytes(b[0:4], "big"),
+                int.from_bytes(b[4:6], "big"),
+                int.from_bytes(b[6:8], "big"),
+                (ctypes.c_uint8 * 8)(*b[8:16]),
+            )
+
+        IID_IDXGIFactory1 = guid_from_hex("7b7166ec21c744aeb21ac9ae321ae369")
+        IID_IDXGIAdapter1 = guid_from_hex("29038f613839462691fd086879011a05")
+
+        p_factory = c_void_p()
+        dxgi.CreateDXGIFactory1.argtypes = [POINTER(GUID), POINTER(c_void_p)]
+        dxgi.CreateDXGIFactory1.restype = c_long
+        if dxgi.CreateDXGIFactory1(byref(IID_IDXGIFactory1), byref(p_factory)) != 0 or not p_factory:
+            return []
+
+        class LUID(ctypes.Structure):
+            _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", c_int)]
+
+        class DXGI_ADAPTER_DESC1(ctypes.Structure):
+            _fields_ = [
+                ("Description", wintypes.WCHAR * 128),
+                ("VendorId", wintypes.UINT),
+                ("DeviceId", wintypes.UINT),
+                ("SubSysId", wintypes.UINT),
+                ("Revision", wintypes.UINT),
+                ("DedicatedVideoMemory", c_size_t),
+                ("DedicatedSystemMemory", c_size_t),
+                ("SharedSystemMemory", c_size_t),
+                ("AdapterLuid", LUID),
+                ("Flags", wintypes.UINT),
+            ]
+
+        DXGI_ADAPTER_FLAG_SOFTWARE = 0x2
+        ENUM_ADAPTERS1_IDX = 12   # IDXGIFactory1::EnumAdapters1
+        GET_DESC1_IDX = 10         # IDXGIAdapter1::GetDesc1
+        RELEASE_IDX = 2            # IUnknown::Release
+
+        factory_vtbl = ctypes.cast(p_factory, POINTER(POINTER(c_void_p))).contents
+        EnumAdapters1 = ctypes.cast(
+            factory_vtbl[ENUM_ADAPTERS1_IDX],
+            ctypes.CFUNCTYPE(c_long, c_void_p, wintypes.UINT, POINTER(c_void_p)),
+        )
+
+        adapters = []
+        seen_devices = set()  # (VendorId, DeviceId)：同一物理 GPU 可能被 EnumAdapters1 多次枚举为不同 LUID 的适配器
+        enumerate_idx = 0  # DXGI 枚举下标（同一块物理卡可能被枚举多次，LUID 不同）
+        while True:
+            p_adapter = c_void_p()
+            hr = EnumAdapters1(p_factory, enumerate_idx, byref(p_adapter))
+            if hr != 0 or not p_adapter:
+                break
+            try:
+                adapter_vtbl = ctypes.cast(p_adapter, POINTER(POINTER(c_void_p))).contents
+                GetDesc1 = ctypes.cast(
+                    adapter_vtbl[GET_DESC1_IDX],
+                    ctypes.CFUNCTYPE(c_long, c_void_p, POINTER(DXGI_ADAPTER_DESC1)),
+                )
+                desc = DXGI_ADAPTER_DESC1()
+                if GetDesc1(p_adapter, byref(desc)) == 0:
+                    is_software = bool(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+                    if not is_software:
+                        # 同一块物理显卡在 DXGI 中会被枚举成多个 LUID 不同的适配器（同 VendorId/DeviceId）。
+                        # 按 (VendorId, DeviceId) 去重，每个型号只保留一条，避免下拉框出现重复项。
+                        dev_key = (desc.VendorId, desc.DeviceId)
+                        if dev_key not in seen_devices:
+                            seen_devices.add(dev_key)
+                            name = "".join(desc.Description).split("\x00", 1)[0]
+                            name = name.strip() or f"Adapter {len(adapters)}"
+                            # 用唯一 GPU 的顺序序号重新编号
+                            adapters.append(f"DirectML:{len(adapters)} ({name})")
+            finally:
+                Release = ctypes.cast(
+                    adapter_vtbl[RELEASE_IDX], ctypes.CFUNCTYPE(c_int, c_void_p)
+                )
+                Release(p_adapter)
+            enumerate_idx += 1
+
+        # 释放 factory
+        try:
+            FactoryRelease = ctypes.cast(
+                factory_vtbl[RELEASE_IDX], ctypes.CFUNCTYPE(c_int, c_void_p)
+            )
+            FactoryRelease(p_factory)
+        except Exception:
+            pass
+        return adapters
+    except Exception:
+        return []
+
+
 def _device_options():
-    """按真实 GPU 数量生成设备下拉项；无 torch 或未检测到可用 GPU 时仅保留自动选择/CPU。"""
+    """生成设备下拉选项：自动选择 / CPU / CUDA:x / DirectML:name。
+
+    全部动态探测，不可用时不列出，避免越界或无效选项。
+    - CUDA：按 torch.cuda.device_count() 列出 CUDA:i (设备名)
+    - DirectML：当 onnxruntime 提供 DmlExecutionProvider 时，按物理 GPU（以 VendorId+DeviceId 去重，同一显卡可能被 DXGI 枚举多次）列出 DirectML:idx (名称)
+    """
     items = ["自动选择", "CPU"]
+    # CUDA 路径（PyTorch）
     try:
         import torch
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
-                items.append(f"CUDA:{i}")
+                name = ""
+                try:
+                    name = torch.cuda.get_device_name(i)
+                except Exception:
+                    pass
+                items.append(f"CUDA:{i} ({name})" if name else f"CUDA:{i}")
+    except Exception:
+        pass
+    # DirectML 路径（ONNX Runtime，仅 Windows）
+    try:
+        import onnxruntime as ort
+        if "DmlExecutionProvider" in ort.get_available_providers():
+            dml_adapters = _enumerate_dml_adapters()
+            if dml_adapters:
+                items.extend(dml_adapters)
+            else:
+                items.append("DirectML")
     except Exception:
         pass
     return items
@@ -85,11 +289,103 @@ class InferenceThread(QThread):
         self.project_classes = project_classes or []
         self.class_mapping = class_mapping or {}  # 类别映射
         self._is_running = False
+        self._use_dml = False  # 本次推理是否走 DirectML（ultralytics 不认识 'dml'，用补丁绑定）
         self.model = None
         self.output_root = Path(__file__).parent.parent.parent / "outputs"
         self.image_output_dir = self.output_root / "test_images"
         self.video_output_dir = self.output_root / "test_videos"
-        
+
+    def _resolve_device(self, raw):
+        """把下拉框的原始设备文本解析成 ultralytics 可用的 device 值。
+
+        注意：ultralytics 的 ONNX 后端不认识 'dml' 字符串，且 select_device()
+        会直接拒绝它。因此无论自动选择还是手动选择 DirectML，这里都返回 'cpu'
+        作为给 ultralytics 的占位值，并把 self._use_dml 置为 True；真正让推理
+        跑在 DirectML 上的是 _install_dml_patch()（在 run() 中调用）。
+
+        自动选择优先级：CUDA 可用 → DirectML 可用 → CPU。
+        显式选择时按格式解析：
+          - 'CUDA:i (名称)' / 'cuda:i' → 'i'
+          - 'DirectML:...'            → 'cpu'（同时置 _use_dml=True）
+          - 'CPU' / '自动选择'        → 走上面的优先级判定
+        """
+        device = str(raw).strip()
+        lowered = device.lower()
+        self._use_dml = False
+
+        # 自动选择：CUDA > DML > CPU
+        if lowered in ["自动选择", "auto", ""]:
+            # 1) CUDA
+            try:
+                import torch
+                if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                    torch.cuda.current_device()  # 实测，避免装了CUDA但不可用
+                    self.log_message.emit("✓ 检测到可用GPU，使用CUDA:0")
+                    return "0"
+            except Exception:
+                pass
+            # 2) DirectML
+            try:
+                import onnxruntime as ort
+                if "DmlExecutionProvider" in ort.get_available_providers():
+                    self._use_dml = True
+                    self.log_message.emit("✓ 未用CUDA，使用 DirectML (DmlExecutionProvider) 进行推理")
+                    return "cpu"  # ultralytics 只接受 cpu/cuda，DML 由补丁绑定
+            except Exception:
+                pass
+            # 3) CPU
+            self.log_message.emit("✗ 未检测到可用GPU/DirectML，使用CPU")
+            return "cpu"
+
+        if lowered in ["cpu"]:
+            self.log_message.emit("✓ 使用CPU进行推理")
+            return "cpu"
+
+        if lowered.startswith("cuda:"):
+            idx = "".join(ch for ch in device.split(":", 1)[1] if ch.isdigit())
+            idx = idx or "0"
+            self.log_message.emit(f"✓ 使用CUDA:{idx}")
+            return idx
+
+        if lowered.startswith("directml"):
+            # 即便手动选了 DirectML，也要确认运行环境真的提供该 provider
+            try:
+                import onnxruntime as ort
+                if "DmlExecutionProvider" in ort.get_available_providers():
+                    self._use_dml = True
+                    self.log_message.emit("✓ 使用 DirectML (DmlExecutionProvider) 进行推理（默认适配器）")
+                    return "cpu"
+            except Exception:
+                pass
+            self.log_message.emit("⚠ 当前环境未提供 DmlExecutionProvider（需安装 onnxruntime-directml），回退 CPU")
+            return "cpu"
+
+        if device.isdigit():
+            self.log_message.emit(f"✓ 使用CUDA:{device}")
+            return device
+
+        self.log_message.emit(f"⚠ 未知设备设置 '{device}'，默认使用CPU")
+        return "cpu"
+
+    def _ensure_onnx_for_dml(self, pt_path):
+        """为 DirectML 推理准备 ONNX 模型。
+
+        优先复用与 .pt 同名的 .onnx；不存在则用 ultralytics 导出。
+        返回 (onnx_path, 'ONNX')。
+        """
+        from pathlib import Path as _P
+        onnx_path = _P(pt_path).with_suffix(".onnx")
+        if onnx_path.exists():
+            self.log_message.emit(f"✓ 找到同名 ONNX 模型: {onnx_path}")
+            return str(onnx_path), "ONNX"
+        self.log_message.emit(f"未找到 {onnx_path.name}，正在从 {pt_path} 导出 ONNX...")
+        from ultralytics import YOLO as _YOLO
+        model = _YOLO(pt_path)
+        exported = model.export(format="onnx")
+        out = str(exported) if exported else str(onnx_path)
+        self.log_message.emit(f"✓ ONNX 导出完成: {out}")
+        return out, "ONNX"
+
     def run(self):
         """运行推理"""
         self._is_running = True
@@ -109,7 +405,29 @@ class InferenceThread(QThread):
             elif self.model_path.endswith('.engine') or self.model_path.endswith('.trt'):
                 model_type = "TensorRT"
             self.log_message.emit(f"模型类型: {model_type}")
-            
+
+            # 解析推理设备（自动选择：CUDA > DirectML > CPU）。
+            # 返回的 device 是给 ultralytics 的合法值（'cpu' / 'cuda:i'）；
+            # 若走 DirectML，device 会是 'cpu' 占位，真正的 DML 由补丁绑定。
+            device = self._resolve_device(self.config.get('device', 'cpu'))
+
+            # 若本次要用 DirectML，安装补丁并标记期望；否则明确关掉（避免上次运行残留）
+            if self._use_dml:
+                _set_dml_desired(True)
+                _install_dml_patch()
+            else:
+                _set_dml_desired(False)
+
+            # DirectML 只能跑 ONNX：若当前是 .pt 则查找/生成同名 ONNX 再使用
+            if self._use_dml and model_type == "PyTorch":
+                try:
+                    self.model_path, model_type = self._ensure_onnx_for_dml(self.model_path)
+                except Exception as e:
+                    self.log_message.emit(f"✗ 生成 ONNX 失败，回退 CPU: {e}")
+                    self._use_dml = False
+                    _set_dml_desired(False)
+                    device = 'cpu'
+
             try:
                 # 获取任务类型，用于ONNX/TensorRT模型
                 task = self.config.get('task', 'detect')
@@ -143,40 +461,7 @@ class InferenceThread(QThread):
             conf = self.config.get('conf', 0.25)
             iou = self.config.get('iou', 0.45)
             imgsz = self.config.get('imgsz', 640)
-            device = self.config.get('device', 'cpu')
-            
-            # 标准化设备值
-            device = str(device).lower().strip()
-            
-            if device in ['自动选择', 'auto', '']:
-                import torch
-                # 更健壮的CUDA检测
-                try:
-                    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-                        # 测试CUDA是否真正可用
-                        torch.cuda.current_device()
-                        device = '0'
-                        self.log_message.emit("✓ 检测到可用GPU，使用CUDA:0")
-                    else:
-                        device = 'cpu'
-                        self.log_message.emit("✗ 未检测到可用GPU，使用CPU")
-                except Exception as cuda_e:
-                    device = 'cpu'
-                    self.log_message.emit(f"⚠ CUDA检测失败，使用CPU: {cuda_e}")
-            elif device in ['cpu', 'CPU']:
-                device = 'cpu'
-                self.log_message.emit("✓ 使用CPU进行推理")
-            elif device.startswith('cuda:') or device.startswith('CUDA:'):
-                device = device.split(':')[1]
-            elif device.isdigit():
-                # 纯数字，认为是GPU ID
-                device = device
-                self.log_message.emit(f"✓ 使用CUDA:{device}")
-            else:
-                # 默认使用CPU
-                device = 'cpu'
-                self.log_message.emit(f"⚠ 未知设备设置 '{device}'，默认使用CPU")
-            
+
             self.log_message.emit(f"推理参数: conf={conf}, iou={iou}, imgsz={imgsz}, device={device}")
             
             total = len(self.data_paths)
