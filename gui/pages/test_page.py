@@ -69,6 +69,7 @@ from gui.pages.train_page import ULTRALYTICS_MODELS, TASK_NAMES, SIZE_NAMES
 # ---------------------------------------------------------------------------
 _DML_PATCH_INSTALLED = False
 _DML_DESIRED = False
+_DML_DEVICE_ID = None  # 要绑定的 DirectML 适配器序号（= DXGI 适配器序号），None 表示默认适配器
 
 
 def _set_dml_desired(value: bool):
@@ -77,14 +78,44 @@ def _set_dml_desired(value: bool):
     _DML_DESIRED = bool(value)
 
 
+def _set_dml_device_id(value):
+    """设置本次推理要绑定的 DirectML 适配器 device_id（= DXGI 适配器序号）。
+
+    None 表示绑定默认适配器。
+    """
+    global _DML_DEVICE_ID
+    try:
+        _DML_DEVICE_ID = None if value is None else int(value)
+    except (TypeError, ValueError):
+        _DML_DEVICE_ID = None
+
+
+def _first_dml_device_id():
+    """自动选择 DirectML 时，返回第一个 DML 适配器的 device_id（= DXGI 适配器序号）。
+
+    枚举为空或解析失败时回退 0（DirectML 默认适配器）。
+    """
+    try:
+        adapters = _enumerate_dml_adapters()
+        if adapters:
+            m = re.search(r"DirectML:(\d+)", adapters[0], re.IGNORECASE)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+    return 0
+
+
 def _install_dml_patch():
     """给 ultralytics 的 ONNX 后端打补丁：加载模型后把会话绑定到 DmlExecutionProvider。
+
+    支持通过 _set_dml_device_id() 指定具体的 DirectML 适配器（device_id 对应 DXGI
+    适配器序号，与 cv_dongan 原生 ORT 写法一致）；未指定时绑定默认适配器。
 
     幂等：多次调用只会安装一次。若补丁失败（例如 ultralytics 内部结构变动），
     不影响后续的 CPU 推理。
     """
-    global _DML_PATCH_INSTALLED, _DML_DESIRED
-    _DML_DESIRED = True
+    global _DML_PATCH_INSTALLED
     if _DML_PATCH_INSTALLED:
         return
     try:
@@ -102,12 +133,22 @@ def _install_dml_patch():
             # 用 DmlExecutionProvider 重新创建会话（替换掉原 CPU 会话）
             if _DML_DESIRED and "DmlExecutionProvider" in _ort.get_available_providers():
                 try:
+                    # DirectML 要求关闭 mem pattern，否则可能静默退化到 WARP 软件渲染
+                    try:
+                        self.session_options.enable_mem_pattern = False
+                        self.session_options.enable_cpu_mem_arena = False
+                    except Exception:
+                        pass
+                    dml_provider = "DmlExecutionProvider"
+                    if _DML_DEVICE_ID is not None:
+                        dml_provider = ("DmlExecutionProvider", {"device_id": _DML_DEVICE_ID})
                     self.session = _ort.InferenceSession(
                         str(weight),
                         self.session_options,
-                        providers=["DmlExecutionProvider", "CPUExecutionProvider"],
+                        providers=[dml_provider, "CPUExecutionProvider"],
                     )
-                    LOGGER.info("已为 ONNX 会话绑定 DmlExecutionProvider（DirectML 加速）")
+                    did = _DML_DEVICE_ID if _DML_DEVICE_ID is not None else "默认"
+                    LOGGER.info(f"已为 ONNX 会话绑定 DmlExecutionProvider (device_id={did})，启用 DirectML 加速")
                 except Exception as e:  # 绑定失败则保持 CPU，不中断推理
                     LOGGER.warning(f"DmlExecutionProvider 绑定失败，回退 CPU: {e}")
 
@@ -213,9 +254,10 @@ def _enumerate_dml_adapters():
                         if dev_key not in seen_devices:
                             seen_devices.add(dev_key)
                             name = "".join(desc.Description).split("\x00", 1)[0]
-                            name = name.strip() or f"Adapter {len(adapters)}"
-                            # 用唯一 GPU 的顺序序号重新编号
-                            adapters.append(f"DirectML:{len(adapters)} ({name})")
+                            name = name.strip() or f"Adapter {enumerate_idx}"
+                            # 用该物理 GPU 首次出现的 DXGI 枚举下标作为标签序号，
+                            # 该序号即为 DirectML 的 device_id（= DXGI 适配器序号）
+                            adapters.append(f"DirectML:{enumerate_idx} ({name})")
             finally:
                 Release = ctypes.cast(
                     adapter_vtbl[RELEASE_IDX], ctypes.CFUNCTYPE(c_int, c_void_p)
@@ -241,7 +283,7 @@ def _device_options():
 
     全部动态探测，不可用时不列出，避免越界或无效选项。
     - CUDA：按 torch.cuda.device_count() 列出 CUDA:i (设备名)
-    - DirectML：当 onnxruntime 提供 DmlExecutionProvider 时，按物理 GPU（以 VendorId+DeviceId 去重，同一显卡可能被 DXGI 枚举多次）列出 DirectML:idx (名称)
+    - DirectML：当 onnxruntime 提供 DmlExecutionProvider 时，按物理 GPU（以 VendorId+DeviceId 去重后）列出 DirectML:device_id (名称)，序号即 DirectML 的 device_id（= DXGI 适配器序号），可精确到指定显卡
     """
     items = ["自动选择", "CPU"]
     # CUDA 路径（PyTorch）
@@ -290,6 +332,7 @@ class InferenceThread(QThread):
         self.class_mapping = class_mapping or {}  # 类别映射
         self._is_running = False
         self._use_dml = False  # 本次推理是否走 DirectML（ultralytics 不认识 'dml'，用补丁绑定）
+        self._dml_device_id = None  # 走 DML 时要绑定的 device_id（= DXGI 适配器序号）
         self.model = None
         self.output_root = Path(__file__).parent.parent.parent / "outputs"
         self.image_output_dir = self.output_root / "test_images"
@@ -306,12 +349,13 @@ class InferenceThread(QThread):
         自动选择优先级：CUDA 可用 → DirectML 可用 → CPU。
         显式选择时按格式解析：
           - 'CUDA:i (名称)' / 'cuda:i' → 'i'
-          - 'DirectML:...'            → 'cpu'（同时置 _use_dml=True）
+          - 'DirectML:device_id (名称)' → 'cpu'（同时置 _use_dml=True，并记录 device_id 交给补丁绑定）
           - 'CPU' / '自动选择'        → 走上面的优先级判定
         """
         device = str(raw).strip()
         lowered = device.lower()
         self._use_dml = False
+        self._dml_device_id = None
 
         # 自动选择：CUDA > DML > CPU
         if lowered in ["自动选择", "auto", ""]:
@@ -329,7 +373,8 @@ class InferenceThread(QThread):
                 import onnxruntime as ort
                 if "DmlExecutionProvider" in ort.get_available_providers():
                     self._use_dml = True
-                    self.log_message.emit("✓ 未用CUDA，使用 DirectML (DmlExecutionProvider) 进行推理")
+                    self._dml_device_id = _first_dml_device_id()
+                    self.log_message.emit(f"✓ 未用CUDA，使用 DirectML (DmlExecutionProvider, device_id={self._dml_device_id}) 进行推理")
                     return "cpu"  # ultralytics 只接受 cpu/cuda，DML 由补丁绑定
             except Exception:
                 pass
@@ -352,8 +397,11 @@ class InferenceThread(QThread):
             try:
                 import onnxruntime as ort
                 if "DmlExecutionProvider" in ort.get_available_providers():
+                    m = re.search(r"directml:(\d+)", lowered)
+                    # 从标签里取出 device_id（= DXGI 适配器序号）；无序号则取第一个适配器
+                    self._dml_device_id = int(m.group(1)) if m else _first_dml_device_id()
                     self._use_dml = True
-                    self.log_message.emit("✓ 使用 DirectML (DmlExecutionProvider) 进行推理（默认适配器）")
+                    self.log_message.emit(f"✓ 使用 DirectML (DmlExecutionProvider, device_id={self._dml_device_id}) 进行推理")
                     return "cpu"
             except Exception:
                 pass
@@ -411,12 +459,15 @@ class InferenceThread(QThread):
             # 若走 DirectML，device 会是 'cpu' 占位，真正的 DML 由补丁绑定。
             device = self._resolve_device(self.config.get('device', 'cpu'))
 
-            # 若本次要用 DirectML，安装补丁并标记期望；否则明确关掉（避免上次运行残留）
+            # 若本次要用 DirectML，安装补丁并标记期望（含要绑定的 device_id）；
+            # 否则明确关掉（避免上次运行残留）
             if self._use_dml:
                 _set_dml_desired(True)
+                _set_dml_device_id(self._dml_device_id)
                 _install_dml_patch()
             else:
                 _set_dml_desired(False)
+                _set_dml_device_id(None)
 
             # DirectML 只能跑 ONNX：若当前是 .pt 则查找/生成同名 ONNX 再使用
             if self._use_dml and model_type == "PyTorch":
